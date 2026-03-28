@@ -1,0 +1,17 @@
+{
+  "records": [
+    {
+      "clip_id": "030c760c-ae38-49aa-9ad8-f5650a545d26",
+      "t0_us": 5100000,
+      "question": "Describe the current driving scene and predict a safe future trajectory.",
+      "reference_answer": "",
+      "nav_text": "",
+      "use_nav_prompt": false,
+      "num_history_steps": 16,
+      "num_future_steps": 64,
+      "time_step": 0.1,
+      "num_frames": 4,
+      "split": "train"
+    }
+  ]
+}
