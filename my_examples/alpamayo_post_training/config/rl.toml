@@ -36,8 +36,10 @@ fsdp_offload = false
 fsdp_reshard_after_forward = "default"
 train_batch_per_replica = 128
 sync_weight_interval = 1
+non_text = true
 
 [rollout]
+backend = "alpa"
 gpu_memory_utilization = 0.7
 enable_chunked_prefill = false
 max_response_length = 6144
@@ -82,7 +84,7 @@ save_mode = "async"
 
 [rollout.parallelism]
 n_init_replicas = 1
-tp_size = 2
+tp_size = 1
 pp_size = 1
 
 [policy.parallelism]

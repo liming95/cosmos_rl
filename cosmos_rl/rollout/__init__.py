@@ -49,6 +49,12 @@ except ImportError as e:
     pass
 
 try:
+    import cosmos_rl.rollout.alpa_rollout.alpa_rollout as alpa_rollout_dummy  # noqa: F401
+except ImportError as e:
+    logger.error(f"Failed to import Alpamayo Rollout. Error: {e}")
+    pass
+
+try:
     import cosmos_rl.rollout.diffuers_rollout.nft_rollout as diffusion_nft_rollout_dummy  # noqa: F401
 except ImportError as e:
     logger.error(f"Failed to import Diffusion NFT Rollout. Error: {e}")

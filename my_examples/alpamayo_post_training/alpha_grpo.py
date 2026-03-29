@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -174,7 +175,9 @@ class AlphaDataPacker(DataPacker):
                 load_weights=False,
             )
 
-    def _build_messages(self, item: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _build_messages(
+        self, item: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         clip_id = item["clip_id"]
         t0_us = int(item.get("t0_us", 5_100_000))
         num_history_steps = int(item.get("num_history_steps", 16))
@@ -209,6 +212,27 @@ class AlphaDataPacker(DataPacker):
             )
 
         return messages, data
+
+    def _inject_fused_history_into_messages(
+        self,
+        messages: list[dict[str, Any]],
+        data: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        fused_messages = copy.deepcopy(messages)
+        if len(fused_messages) < 2 or "content" not in fused_messages[1]:
+            return fused_messages
+
+        user_content = fused_messages[1]["content"]
+        if not isinstance(user_content, list):
+            return fused_messages
+
+        for content in reversed(user_content):
+            if content.get("type") != "text":
+                continue
+            original_text = content.get("text", "")
+            content["text"] = self._build_vllm_prompt(original_text, data)
+            break
+        return fused_messages
 
     def _combine_image_traj(self, input_data: str, traj_data_vlm: dict[str, Any]) -> str:
         """Char-level version of `fuse_traj_tokens`.
@@ -274,38 +298,53 @@ class AlphaDataPacker(DataPacker):
 
     def get_rollout_input(self, item: Any) -> Any:
         """
-        Convert one Alpamayo sample descriptor into the rollout-engine input format.
+        Convert one Alpamayo sample descriptor into the alpa-rollout input format.
 
-        Output format is delegated to `Qwen3_VL_DataPacker`, so the final return value
-        is still the standard:
-        {
-            "prompt": ...,
-            "multi_modal_data": {"image": ...},
-        }
+        The rollout backend keeps using the full Alpamayo generation path, so we pass
+        structured chat messages plus the trajectory tensors directly. The policy side
+        still reuses the VL packer and trains only on the reasoning text.
         """
         assert isinstance(item, dict), (
             f"AlphaDataPacker expects dict items from dataset, but got {type(item)}"
         )
         messages, data = self._build_messages(item)
-        vllm_inputs = self.underlying_data_packer.get_rollout_input(messages)
-        vllm_inputs = {k: v for k, v in vllm_inputs.items() if k != "prompt"}
-
         prompt = self.underlying_data_packer.hf_processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             continue_final_message=True,
         )
-        vllm_inputs["prompt"] = self._build_vllm_prompt(prompt, data)
-        return vllm_inputs
+        return {
+            "messages": messages,
+            "ego_history_xyz": data["ego_history_xyz"],
+            "ego_history_rot": data["ego_history_rot"],
+            "prompt": self._build_vllm_prompt(prompt, data),
+        }
 
     def rollout_collate_fn(self, items: list[Any]) -> Any:
-        return self.underlying_data_packer.rollout_collate_fn(items)
+        return items
+
+    def get_rollout_output(
+        self,
+        completions: list[Any],
+        completed_conversations: list[Any],
+        logprobs: list[Any],
+        token_ids: list[Any],
+        **kwargs,
+    ) -> tuple[list[Any], list[Any], list[Any], list[Any], dict[str, Any]]:
+        """Keep the structured completion dicts intact for reward and future dual-model use."""
+        return completions, completed_conversations, logprobs, token_ids, kwargs
 
     def get_policy_input(
-        self, item: Any, rollout_output: str, n_ignore_prefix_tokens: int = 0
+        self, item: Any, rollout_output: Any, n_ignore_prefix_tokens: int = 0
     ) -> Any:
-        messages, _ = self._build_messages(item)
+        messages, data = self._build_messages(item)
+        messages = self._inject_fused_history_into_messages(messages, data)
+        if isinstance(rollout_output, dict):
+            if self.config.train.train_policy.rollout_as_token_ids:
+                rollout_output = rollout_output.get("reasoning_token_ids", [])
+            else:
+                rollout_output = rollout_output.get("reasoning", "")
         return self.underlying_data_packer.get_policy_input(
             messages,
             rollout_output,
@@ -328,6 +367,10 @@ def fake_reward_fn(
     to_be_evaluated: str, reference: Optional[str] = None, *args, **kwargs
 ) -> float:
     del reference, args, kwargs
+    if isinstance(to_be_evaluated, dict):
+        reasoning = str(to_be_evaluated.get("reasoning", "")).strip()
+        has_action = 1.0 if to_be_evaluated.get("action") is not None else 0.0
+        return 0.1 + min(len(reasoning) / 1024.0, 0.7) + 0.2 * has_action
     if not isinstance(to_be_evaluated, str):
         return 0.1
     # Deterministic fake reward to keep the GRPO pipeline numerically alive.
