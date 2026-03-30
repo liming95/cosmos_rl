@@ -58,11 +58,16 @@ from cosmos_rl.utils import constant
 from cosmos_rl.policy.worker.base import PolicyWorkerBase
 from cosmos_rl.collective.collective import P2RCollectiveManager
 from cosmos_rl.utils.perf_utils import (
+    accumulate_perf_metrics,
+    append_perf_summary,
     format_perf_metrics,
     inject_perf_metrics,
+    inject_perf_summary,
     measure_time,
     new_perf_metrics,
     stage_perf_enabled,
+    summarize_perf_metrics,
+    write_perf_summary,
 )
 
 
@@ -83,6 +88,9 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         self.report_data = {}
         self.upload_thread = None
+        self.perf_totals = new_perf_metrics()
+        self.perf_counts: Dict[str, int] = {}
+        self._perf_summary_emitted = False
 
         # Model Status related
         self.model_ready = False
@@ -222,6 +230,7 @@ class RLPolicyWorker(PolicyWorkerBase):
     def handle_shutdown(self):
         if not hasattr(self, "_handle_shutdown_called"):
             self._handle_shutdown_called = True
+            self.emit_perf_summary()
 
             self.shutdown_signal.set()
             self.shutdown_mp_signal.set()
@@ -259,6 +268,46 @@ class RLPolicyWorker(PolicyWorkerBase):
             # Another notice is that make sure the background threads detect the shutdown event in less than 15 seconds
             # Otherwise, the main thread may exit before the background threads detect the shutdown event
             time.sleep(15)
+
+    def emit_perf_summary(self):
+        if not stage_perf_enabled() or self._perf_summary_emitted:
+            return
+        self._perf_summary_emitted = True
+
+        payload: Dict[str, object] = {
+            "role": "policy",
+            "replica_name": self.replica_name,
+            "global_rank": self.global_rank,
+            "policy_worker": summarize_perf_metrics(
+                self.perf_totals,
+                count=sum(self.perf_counts.values()),
+            ),
+            "policy_counts": dict(self.perf_counts),
+        }
+
+        trainer_totals = getattr(self.trainer, "_perf_train_totals", None)
+        trainer_count = getattr(self.trainer, "_perf_train_count", 0)
+        if trainer_totals is not None:
+            payload["trainer"] = summarize_perf_metrics(
+                trainer_totals,
+                count=trainer_count,
+            )
+            payload["trainer_count"] = trainer_count
+
+        summary_path = write_perf_summary(
+            self.config.train.output_dir,
+            category="policy",
+            replica_name=self.replica_name,
+            global_rank=self.global_rank,
+            payload=payload,
+        )
+        summary_index = append_perf_summary(self.config.train.output_dir, payload)
+        logger.info(
+            "[Perf][Summary][Policy] path=%s index=%s payload=%s",
+            summary_path,
+            summary_index,
+            payload,
+        )
 
     async def fetch_rollouts(self):
         assert self.global_rank == 0, "Only rank 0 can fetch rollouts"
@@ -329,11 +378,16 @@ class RLPolicyWorker(PolicyWorkerBase):
             f"[Policy] Policy2Policy Broadcast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {len(command.dst_replica_names)} replicas took {perf_metrics['p2p_broadcast_total']:.3f} seconds."
         )
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["p2p_broadcast"] = (
+                self.perf_counts.get("p2p_broadcast", 0) + 1
+            )
             logger.info(
-                "[Perf][PolicySync][P2PBroadcast] send=%s recv=%s %s",
+                "[Perf][PolicySync][P2PBroadcast] send=%s recv=%s step={%s} total={%s}",
                 send,
                 recv,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return False
 
@@ -371,11 +425,16 @@ class RLPolicyWorker(PolicyWorkerBase):
             f"[Policy] Policy2Policy Unicast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {command.dst_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.dst_replica_name)}) as sender {send} took {perf_metrics['p2p_unicast_total']:.3f} seconds."
         )
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["p2p_unicast"] = (
+                self.perf_counts.get("p2p_unicast", 0) + 1
+            )
             logger.info(
-                "[Perf][PolicySync][P2PUnicast] send=%s recv=%s %s",
+                "[Perf][PolicySync][P2PUnicast] send=%s recv=%s step={%s} total={%s}",
                 send,
                 recv,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return False
 
@@ -555,17 +614,20 @@ class RLPolicyWorker(PolicyWorkerBase):
                 + perf_metrics["p2r_prepare_tensor"]
                 + perf_metrics["p2r_send_comm"]
             )
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["p2r"] = self.perf_counts.get("p2r", 0) + 1
         logger.debug(
             f"[Policy] All {len(self.policy_to_rollout_insts)} at step {command.weight_step} send operations of finished in {perf_metrics['p2r_total'] if perf_enabled else 0.0:.3f} seconds with {total_bytes_sent / (1024 * 1024)} MB sent. While {skipped_params_cnt} non-trainable splitted params skipped and {transferred_params_cnt} splitted params transferred."
         )
         if perf_enabled:
             logger.info(
-                "[Perf][PolicySync][P2R] step=%s bytes_mb=%.3f transferred=%s skipped=%s %s",
+                "[Perf][PolicySync][P2R] step=%s bytes_mb=%.3f transferred=%s skipped=%s step={%s} total={%s}",
                 command.weight_step,
                 total_bytes_sent / (1024 * 1024),
                 transferred_params_cnt,
                 skipped_params_cnt,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return False
 
@@ -645,6 +707,12 @@ class RLPolicyWorker(PolicyWorkerBase):
         if is_master_rank(self.parallel_dims, self.global_rank):
             if perf_enabled:
                 inject_perf_metrics(report_data, perf_metrics, prefix="perf/policy")
+                inject_perf_summary(
+                    report_data,
+                    self.perf_totals,
+                    prefix="perf/policy_summary",
+                    count=self.perf_counts.get("policy_train", 0) + 1,
+                )
             with measure_time(
                 perf_metrics,
                 "train_ack_post",
@@ -660,11 +728,16 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         logger.debug(f"[Policy] Train ack sent for global step {command.global_step}.")
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["policy_train"] = (
+                self.perf_counts.get("policy_train", 0) + 1
+            )
             logger.info(
-                "[Perf][PolicyTrain] step=%s fake_step=%s %s",
+                "[Perf][PolicyTrain] step=%s fake_step=%s step={%s} total={%s}",
                 command.global_step,
                 is_fake_step,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return command.replica_should_stop()
 
@@ -885,11 +958,16 @@ class RLPolicyWorker(PolicyWorkerBase):
             if self.world_size == 1:
                 result = preprocess_rollouts(scattered_rollouts[0])
                 if perf_enabled:
+                    accumulate_perf_metrics(self.perf_totals, perf_metrics)
+                    self.perf_counts["policy_dispatch"] = (
+                        self.perf_counts.get("policy_dispatch", 0) + 1
+                    )
                     logger.info(
-                        "[Perf][PolicyDispatch] batch=%s world_size=%s %s",
+                        "[Perf][PolicyDispatch] batch=%s world_size=%s step={%s} total={%s}",
                         len(result),
                         self.world_size,
                         format_perf_metrics(perf_metrics),
+                        format_perf_metrics(self.perf_totals),
                     )
                 return result
 
@@ -905,11 +983,16 @@ class RLPolicyWorker(PolicyWorkerBase):
                 )
         result = preprocess_rollouts(rollouts[0])
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["policy_dispatch"] = (
+                self.perf_counts.get("policy_dispatch", 0) + 1
+            )
             logger.info(
-                "[Perf][PolicyDispatch] batch=%s world_size=%s %s",
+                "[Perf][PolicyDispatch] batch=%s world_size=%s step={%s} total={%s}",
                 len(result),
                 self.world_size,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return result
 
@@ -1037,5 +1120,6 @@ class RLPolicyWorker(PolicyWorkerBase):
         )
 
     def destroy_worker(self):
+        self.emit_perf_summary()
         destroy_distributed()
         logger.info("[Policy] Process group destroyed.")

@@ -75,10 +75,14 @@ from cosmos_rl.reward.dispatcher import RewardDispatcher
 from cosmos_rl.dispatcher.data.data_fetcher import WorkerDataFetcher
 from cosmos_rl.collective.collective import P2RCollectiveManager
 from cosmos_rl.utils.perf_utils import (
+    accumulate_perf_metrics,
+    append_perf_summary,
     format_perf_metrics,
     measure_time,
     new_perf_metrics,
     stage_perf_enabled,
+    summarize_perf_metrics,
+    write_perf_summary,
 )
 
 """
@@ -113,6 +117,9 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         self._command_queue: Queue[Command] = Queue()
         self._prompt_queue: Queue[List[RLPayload]] = Queue()
         self.current_weight_version = 0
+        self.perf_totals = new_perf_metrics()
+        self.perf_counts = {}
+        self._perf_summary_emitted = False
 
         # determine the quantization type
         self.quantization_type = None
@@ -333,6 +340,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         # Only call once
         if not hasattr(self, "_shutdown_handled"):
             self._shutdown_handled = True
+            self.emit_perf_summary()
             if not self.shutdown_signal.is_set():
                 logger.info(
                     f"[Rollout] shutdown instruction of {self.replica_name}, setting shutdown signal"
@@ -354,6 +362,36 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 self.heartbeat_thread.join()
                 self.heartbeat_thread = None
             self.unregister_from_controller()
+
+    def emit_perf_summary(self):
+        if not stage_perf_enabled() or self._perf_summary_emitted:
+            return
+        self._perf_summary_emitted = True
+
+        payload = {
+            "role": "rollout",
+            "replica_name": self.replica_name,
+            "global_rank": self.global_rank,
+            "rollout_worker": summarize_perf_metrics(
+                self.perf_totals,
+                count=sum(self.perf_counts.values()),
+            ),
+            "rollout_counts": dict(self.perf_counts),
+        }
+        summary_path = write_perf_summary(
+            self.config.train.output_dir,
+            category="rollout",
+            replica_name=self.replica_name,
+            global_rank=self.global_rank,
+            payload=payload,
+        )
+        summary_index = append_perf_summary(self.config.train.output_dir, payload)
+        logger.info(
+            "[Perf][Summary][Rollout] path=%s index=%s payload=%s",
+            summary_path,
+            summary_index,
+            payload,
+        )
 
     def get_underlying_model(self):
         """
@@ -1428,11 +1466,16 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if prompts is not None:
             prompt_queue.put(prompts)
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["rollout_prompt"] = (
+                self.perf_counts.get("rollout_prompt", 0) + 1
+            )
             logger.info(
-                "[Perf][RolloutPrompt] batch=%s prompts=%s %s",
+                "[Perf][RolloutPrompt] batch=%s prompts=%s step={%s} total={%s}",
                 batch_size,
                 len(prompts) if prompts is not None else 0,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return is_end
 
@@ -1604,10 +1647,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             elif not block or empty:
                 break
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["rollout_report"] = (
+                self.perf_counts.get("rollout_report", 0) + 1
+            )
             logger.info(
-                "[Perf][RolloutReport] block=%s %s",
+                "[Perf][RolloutReport] block=%s step={%s} total={%s}",
                 block,
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return payloads, is_validation, step, empty
 
@@ -1819,10 +1867,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 rollout_results, payloads_list
             )
         if perf_enabled:
+            accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            self.perf_counts["rollout_step"] = (
+                self.perf_counts.get("rollout_step", 0) + 1
+            )
             logger.info(
-                "[Perf][RolloutStep] prompts=%s %s",
+                "[Perf][RolloutStep] prompts=%s step={%s} total={%s}",
                 len(payloads_list),
                 format_perf_metrics(perf_metrics),
+                format_perf_metrics(self.perf_totals),
             )
         return result
 

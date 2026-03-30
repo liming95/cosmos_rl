@@ -1,7 +1,9 @@
 import os
 import time
+import json
 from collections import defaultdict
 from contextlib import contextmanager
+from pathlib import Path
 from typing import DefaultDict, Dict, Iterable
 
 import torch
@@ -55,6 +57,68 @@ def measure_time(
 
 def perf_metrics_to_dict(metrics: DefaultDict[str, float]) -> Dict[str, float]:
     return {k: float(v) for k, v in metrics.items()}
+
+
+def accumulate_perf_metrics(
+    total_metrics: DefaultDict[str, float],
+    step_metrics: Dict[str, float] | DefaultDict[str, float],
+) -> None:
+    for key, value in step_metrics.items():
+        total_metrics[key] += float(value)
+
+
+def inject_perf_summary(
+    target: Dict[str, float],
+    total_metrics: Dict[str, float] | DefaultDict[str, float],
+    *,
+    prefix: str,
+    count: int,
+) -> None:
+    count = max(int(count), 1)
+    target[f"{prefix}/count"] = float(count)
+    for key, value in total_metrics.items():
+        value = float(value)
+        target[f"{prefix}/total/{key}"] = value
+        target[f"{prefix}/avg/{key}"] = value / count
+
+
+def summarize_perf_metrics(
+    total_metrics: Dict[str, float] | DefaultDict[str, float],
+    *,
+    count: int,
+) -> Dict[str, float]:
+    count = max(int(count), 1)
+    summary: Dict[str, float] = {"count": float(count)}
+    for key, value in total_metrics.items():
+        value = float(value)
+        summary[f"total/{key}"] = value
+        summary[f"avg/{key}"] = value / count
+    return summary
+
+
+def write_perf_summary(
+    output_dir: str,
+    *,
+    category: str,
+    replica_name: str,
+    global_rank: int,
+    payload: Dict,
+) -> str:
+    summary_dir = Path(output_dir) / "perf_summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    path = summary_dir / f"{category}_{replica_name}_{global_rank}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return str(path)
+
+
+def append_perf_summary(output_dir: str, payload: Dict) -> str:
+    summary_dir = Path(output_dir) / "perf_summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    path = summary_dir / "all_summaries.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+    return str(path)
 
 
 def inject_perf_metrics(

@@ -39,7 +39,9 @@ from cosmos_rl.utils.util import (
     setup_tokenizer,
 )
 from cosmos_rl.utils.perf_utils import (
+    accumulate_perf_metrics,
     inject_perf_metrics,
+    inject_perf_summary,
     measure_time,
     new_perf_metrics,
     stage_perf_enabled,
@@ -958,6 +960,9 @@ class GRPOTrainer(LLMTrainer):
         perf_metrics = new_perf_metrics()
         step_wall_start = time.perf_counter()
         self._perf_train_metrics = perf_metrics
+        if not hasattr(self, "_perf_train_totals"):
+            self._perf_train_totals = new_perf_metrics()
+            self._perf_train_count = 0
         pp_last_stage = (
             self.parallel_dims.pp_coord[0] == self.parallel_dims.pp_coord[1] - 1
         )
@@ -1952,12 +1957,23 @@ class GRPOTrainer(LLMTrainer):
         self.clear_teacher_result_cache()
         if perf_enabled:
             perf_metrics["step_total_wall"] += time.perf_counter() - step_wall_start
+            accumulate_perf_metrics(self._perf_train_totals, perf_metrics)
+            self._perf_train_count += 1
             if is_master_rank(self.parallel_dims, self.global_rank):
                 inject_perf_metrics(report_data, perf_metrics, prefix="perf/train")
+                inject_perf_summary(
+                    report_data,
+                    self._perf_train_totals,
+                    prefix="perf/train_summary",
+                    count=self._perf_train_count,
+                )
             logger.info(
-                "[Perf][GRPOTrain] step=%s %s",
+                "[Perf][GRPOTrain] step=%s step={%s} total={%s}",
                 current_step,
                 ", ".join(f"{k}={v:.4f}s" for k, v in sorted(perf_metrics.items())),
+                ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(self._perf_train_totals.items())
+                ),
             )
         self._perf_train_metrics = None
         return report_data
