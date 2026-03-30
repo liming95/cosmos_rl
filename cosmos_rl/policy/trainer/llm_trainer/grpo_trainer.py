@@ -38,6 +38,12 @@ from cosmos_rl.utils.util import (
     compute_mfu,
     setup_tokenizer,
 )
+from cosmos_rl.utils.perf_utils import (
+    inject_perf_metrics,
+    measure_time,
+    new_perf_metrics,
+    stage_perf_enabled,
+)
 from cosmos_rl.dispatcher.data.schema import Rollout
 from cosmos_rl.utils.balance_seqlen import rearrange_mini_batches
 from cosmos_rl.utils.sequence_packing import (
@@ -948,6 +954,10 @@ class GRPOTrainer(LLMTrainer):
         do_save_checkpoint: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
+        step_wall_start = time.perf_counter()
+        self._perf_train_metrics = perf_metrics
         pp_last_stage = (
             self.parallel_dims.pp_coord[0] == self.parallel_dims.pp_coord[1] - 1
         )
@@ -1008,14 +1018,19 @@ class GRPOTrainer(LLMTrainer):
         assert all(samples[i] is not None for i in range(len(samples))), (
             "All samples should be not None"
         )
-        processed_samples: List[Any] = [
-            self.data_packer.get_policy_input(
-                samples[i],
-                completions_list[i],
-                n_ignore_prefix_tokens_list[i],
-            )
-            for i in range(len(samples))
-        ]
+        with measure_time(
+            perf_metrics,
+            "prepare_policy_inputs",
+            enabled=perf_enabled,
+        ):
+            processed_samples: List[Any] = [
+                self.data_packer.get_policy_input(
+                    samples[i],
+                    completions_list[i],
+                    n_ignore_prefix_tokens_list[i],
+                )
+                for i in range(len(samples))
+            ]
 
         # On-policy Distillation related computations
         assert len(processed_samples) == len(rollouts) and len(samples) == len(
@@ -1080,6 +1095,7 @@ class GRPOTrainer(LLMTrainer):
 
         cached_minibatch_arrangements = []
         for phase in trainer_phases:
+            phase_metric_key = f"phase_{phase.value}"
             is_computing_ref = phase == TrainerPhase.REF_COMPUTE
             is_computing_old_ahead = phase == TrainerPhase.OLD_LOGP_COMPUTE
             # Set model to eval mode if reference model is being used
@@ -1094,94 +1110,106 @@ class GRPOTrainer(LLMTrainer):
                     self.model.eval()
                 else:
                     self.model.train()
-
-            with torch.set_grad_enabled(phase == TrainerPhase.TRAIN):
-                for i_mu in range(
-                    1
-                    if (is_computing_ref or is_computing_old_ahead)
-                    else self.mu_iterations
-                ):
-                    local_mini_step = 0
-                    local_optimize_step = 0
-                    with torch.cuda.stream(self.train_stream):
-                        for i in range(0, batch_size, per_optimize_batch_size):
-                            end = min(i + per_optimize_batch_size, batch_size)
-                            # Convert advantages from [batch_size] -> [batch_size, max_len] via expanding
-                            processed_samples_for_optimize = processed_samples[i:end]
-                            if len(cached_minibatch_arrangements) > local_optimize_step:
-                                (
-                                    mini_batches,
-                                    mini_batch_index,
-                                ) = cached_minibatch_arrangements[local_optimize_step]
-                            else:
+            with measure_time(
+                perf_metrics,
+                phase_metric_key,
+                enabled=perf_enabled,
+                cuda_device=self.device,
+            ):
+                with torch.set_grad_enabled(phase == TrainerPhase.TRAIN):
+                    for i_mu in range(
+                        1
+                        if (is_computing_ref or is_computing_old_ahead)
+                        else self.mu_iterations
+                    ):
+                        local_mini_step = 0
+                        local_optimize_step = 0
+                        with torch.cuda.stream(self.train_stream):
+                            for i in range(0, batch_size, per_optimize_batch_size):
+                                end = min(i + per_optimize_batch_size, batch_size)
+                                # Convert advantages from [batch_size] -> [batch_size, max_len] via expanding
+                                processed_samples_for_optimize = processed_samples[i:end]
                                 if (
-                                    self.config.train.train_policy.max_token_len_per_mini_batch
-                                    is not None
-                                    and self.config.train.train_policy.max_token_len_per_mini_batch
-                                    > 0
+                                    len(cached_minibatch_arrangements)
+                                    > local_optimize_step
                                 ):
-                                    minibatch_seq_len = [
-                                        self.data_packer.policy_compute_max_len(
-                                            [sample]
-                                        )
-                                        for sample in processed_samples_for_optimize
+                                    (
+                                        mini_batches,
+                                        mini_batch_index,
+                                    ) = cached_minibatch_arrangements[
+                                        local_optimize_step
                                     ]
-                                    # split batch into mini_batches with sequence parallelism
-                                    if self.parallel_dims.cp_enabled:
-                                        cp_size = self.parallel_dims.mesh["cp"].size()
-                                    else:
-                                        cp_size = 1
-                                    max_token_len = (
-                                        self.config.train.train_policy.max_token_len_per_mini_batch
-                                        * cp_size
-                                    )
-                                    # dynamic rearrange mini batches
-                                    mini_batches, mini_batch_index = (
-                                        rearrange_mini_batches(
-                                            batch=processed_samples_for_optimize,
-                                            seq_len_effective=minibatch_seq_len,
-                                            max_token_len=max_token_len,
-                                            ddp_comm=inter_policy_nccl,
-                                        )
-                                    )
                                 else:
-                                    # split batch into mini_batches
-                                    mini_batches = [
-                                        processed_samples_for_optimize[
-                                            i : i + self.mini_batch
+                                    if (
+                                        self.config.train.train_policy.max_token_len_per_mini_batch
+                                        is not None
+                                        and self.config.train.train_policy.max_token_len_per_mini_batch
+                                        > 0
+                                    ):
+                                        minibatch_seq_len = [
+                                            self.data_packer.policy_compute_max_len(
+                                                [sample]
+                                            )
+                                            for sample in processed_samples_for_optimize
                                         ]
-                                        for i in range(
-                                            0,
-                                            len(processed_samples_for_optimize),
-                                            self.mini_batch,
+                                        # split batch into mini_batches with sequence parallelism
+                                        if self.parallel_dims.cp_enabled:
+                                            cp_size = self.parallel_dims.mesh["cp"].size()
+                                        else:
+                                            cp_size = 1
+                                        max_token_len = (
+                                            self.config.train.train_policy.max_token_len_per_mini_batch
+                                            * cp_size
                                         )
-                                    ]
-                                    mini_batch_index = [
-                                        list(
-                                            range(
-                                                i,
-                                                min(
-                                                    i + self.mini_batch,
-                                                    len(processed_samples_for_optimize),
-                                                ),
+                                        # dynamic rearrange mini batches
+                                        mini_batches, mini_batch_index = (
+                                            rearrange_mini_batches(
+                                                batch=processed_samples_for_optimize,
+                                                seq_len_effective=minibatch_seq_len,
+                                                max_token_len=max_token_len,
+                                                ddp_comm=inter_policy_nccl,
                                             )
                                         )
-                                        for i in range(
-                                            0,
-                                            len(processed_samples_for_optimize),
-                                            self.mini_batch,
-                                        )
-                                    ]
-                                cached_minibatch_arrangements.append(
-                                    (mini_batches, mini_batch_index)
-                                )
-                            for (
-                                minibatched_processed_samples,
-                                mini_batch_indices,
-                            ) in zip(mini_batches, mini_batch_index):
-                                loss_scaling_factor = len(
-                                    minibatched_processed_samples
-                                ) / len(processed_samples_for_optimize)
+                                    else:
+                                        # split batch into mini_batches
+                                        mini_batches = [
+                                            processed_samples_for_optimize[
+                                                i : i + self.mini_batch
+                                            ]
+                                            for i in range(
+                                                0,
+                                                len(processed_samples_for_optimize),
+                                                self.mini_batch,
+                                            )
+                                        ]
+                                        mini_batch_index = [
+                                            list(
+                                                range(
+                                                    i,
+                                                    min(
+                                                        i + self.mini_batch,
+                                                        len(
+                                                            processed_samples_for_optimize
+                                                        ),
+                                                    ),
+                                                )
+                                            )
+                                            for i in range(
+                                                0,
+                                                len(processed_samples_for_optimize),
+                                                self.mini_batch,
+                                            )
+                                        ]
+                                    cached_minibatch_arrangements.append(
+                                        (mini_batches, mini_batch_index)
+                                    )
+                                for (
+                                    minibatched_processed_samples,
+                                    mini_batch_indices,
+                                ) in zip(mini_batches, mini_batch_index):
+                                    loss_scaling_factor = len(
+                                        minibatched_processed_samples
+                                    ) / len(processed_samples_for_optimize)
                                 # TODO(jiaxin): support variable length in PP
                                 computed_max_len = (
                                     self.config.policy.model_max_length
@@ -1884,33 +1912,54 @@ class GRPOTrainer(LLMTrainer):
                 logger.info(
                     f"[Policy] Saving huggingface checkpoint at step {current_step} to {self.config.train.output_dir}..."
                 )
-                self.export_safetensors(
-                    output_dir=self.config.train.output_dir,
-                    rel_path=os.path.join(
-                        "safetensors",
-                        f"step_{current_step}",
-                    ),
-                    trainable_only=False,
-                    is_final=is_last_step,
-                    dtype=str2torch_dtype(self.config.train.param_dtype),
-                )
+                with measure_time(
+                    perf_metrics,
+                    "checkpoint_export",
+                    enabled=perf_enabled,
+                    cuda_device=self.device,
+                ):
+                    self.export_safetensors(
+                        output_dir=self.config.train.output_dir,
+                        rel_path=os.path.join(
+                            "safetensors",
+                            f"step_{current_step}",
+                        ),
+                        trainable_only=False,
+                        is_final=is_last_step,
+                        dtype=str2torch_dtype(self.config.train.param_dtype),
+                    )
             logger.info(f"[Policy] Saving cosmos checkpoint at step {current_step}...")
-            self.ckpt_manager.save_checkpoint(
-                model=self.model,
-                optimizer=self.optimizers,
-                scheduler=self.lr_schedulers,
-                step=current_step,
-                total_steps=total_steps,
-                **{
-                    "remain_samples_num": remain_samples_num,
-                    "is_final": is_last_step,
-                },
-            )
+            with measure_time(
+                perf_metrics,
+                "checkpoint_save",
+                enabled=perf_enabled,
+            ):
+                self.ckpt_manager.save_checkpoint(
+                    model=self.model,
+                    optimizer=self.optimizers,
+                    scheduler=self.lr_schedulers,
+                    step=current_step,
+                    total_steps=total_steps,
+                    **{
+                        "remain_samples_num": remain_samples_num,
+                        "is_final": is_last_step,
+                    },
+                )
             self.ckpt_manager.save_check(step=current_step)
 
         self.reference_reset(current_step)
 
         self.clear_teacher_result_cache()
+        if perf_enabled:
+            perf_metrics["step_total_wall"] += time.perf_counter() - step_wall_start
+            if is_master_rank(self.parallel_dims, self.global_rank):
+                inject_perf_metrics(report_data, perf_metrics, prefix="perf/train")
+            logger.info(
+                "[Perf][GRPOTrain] step=%s %s",
+                current_step,
+                ", ".join(f"{k}={v:.4f}s" for k, v in sorted(perf_metrics.items())),
+            )
+        self._perf_train_metrics = None
         return report_data
 
     def reference_reset(self, current_step: int):
@@ -2096,15 +2145,23 @@ class GRPOTrainer(LLMTrainer):
         """
         # Add nccl allreduce operations for all parameters and necessary states.
         """
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = getattr(self, "_perf_train_metrics", None)
         with torch.cuda.stream(self.train_stream):
             for model_part in self.model_parts:
                 # Model part may use same physical mesh for different logical mesh,
                 # which is not supported by DTensor operands like `torch.nn.utils.get_total_norm`
                 # So we need to do allreduce for each model part
                 if model_part is not None:
-                    dist_util.gradient_reduce_across_dp_replicas_(
-                        [p for p in model_part.parameters()], inter_policy_nccl
-                    )
+                    with measure_time(
+                        perf_metrics,
+                        "all_reduce_comm",
+                        enabled=perf_enabled and perf_metrics is not None,
+                        cuda_device=self.device,
+                    ):
+                        dist_util.gradient_reduce_across_dp_replicas_(
+                            [p for p in model_part.parameters()], inter_policy_nccl
+                        )
             """
             Compute the global grad norm on all parameters and then apply
             gradient clipping using the global grad norm.
@@ -2116,17 +2173,23 @@ class GRPOTrainer(LLMTrainer):
                 for m in [model for model in self.model_parts if model is not None]
                 for p in m.parameters()
             ]
-            grad_norm = dist_util.gradient_norm_clipping(
-                all_params,
-                self.config.train.optm_grad_norm_clip,
-                foreach=True,
-                pp_mesh=self.parallel_dims.mesh["pp"]
-                if self.parallel_dims.pp_enabled
-                else None,
-                return_norm_only=(self.config.train.optm_grad_norm_clip <= 0.0),
-            )
-            self.optimizers.step()
-            self.optimizers.zero_grad()
+            with measure_time(
+                perf_metrics,
+                "optimizer_step",
+                enabled=perf_enabled and perf_metrics is not None,
+                cuda_device=self.device,
+            ):
+                grad_norm = dist_util.gradient_norm_clipping(
+                    all_params,
+                    self.config.train.optm_grad_norm_clip,
+                    foreach=True,
+                    pp_mesh=self.parallel_dims.mesh["pp"]
+                    if self.parallel_dims.pp_enabled
+                    else None,
+                    return_norm_only=(self.config.train.optm_grad_norm_clip <= 0.0),
+                )
+                self.optimizers.step()
+                self.optimizers.zero_grad()
         return grad_norm
 
     @property

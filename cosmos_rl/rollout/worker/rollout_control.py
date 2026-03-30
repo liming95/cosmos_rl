@@ -74,6 +74,12 @@ from cosmos_rl.rollout.schema import RolloutResult
 from cosmos_rl.reward.dispatcher import RewardDispatcher
 from cosmos_rl.dispatcher.data.data_fetcher import WorkerDataFetcher
 from cosmos_rl.collective.collective import P2RCollectiveManager
+from cosmos_rl.utils.perf_utils import (
+    format_perf_metrics,
+    measure_time,
+    new_perf_metrics,
+    stage_perf_enabled,
+)
 
 """
 Keep in mind that torch distributed is not thread safe. So try to keep the usage in the same thread.
@@ -1310,6 +1316,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         """
         Request new prompts from the controller for both training and validation.
         """
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         prompts_and_is_end = (None, False)
         if self.global_rank == 0:
             # request new prompts for all ranks from controller only on global rank 0
@@ -1317,9 +1325,14 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             if prompt_queue.empty():
                 # blocking request to get prompts from controller
                 # batch_size is per data parallel rank so we need to multiply it with data parallel size
-                payloads, is_end = self.api_client.get_next_prompt(
-                    batch_size * self.parallel_dims.mesh["dp"].size(), **kwargs
-                )
+                with measure_time(
+                    perf_metrics,
+                    "prompt_fetch_api",
+                    enabled=perf_enabled,
+                ):
+                    payloads, is_end = self.api_client.get_next_prompt(
+                        batch_size * self.parallel_dims.mesh["dp"].size(), **kwargs
+                    )
 
                 assert all(payload["prompt_idx"] >= 0 for payload in payloads), (
                     "All payloads should have a valid prompt index"
@@ -1337,18 +1350,25 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
                 if len(payloads) > 0:
                     if self.config.train.local_dataset:
-                        for payload in payloads:
-                            payload["prompt"] = self.data_fetcher.get_payload_by_index(
-                                payload["prompt_idx"],
-                                is_validation=is_validation,
-                            )
-                            payload["conversation"] = (
-                                self.data_fetcher.get_payload_by_index(
-                                    payload["prompt_idx"],
-                                    is_validation=is_validation,
-                                    attr="conversation",
+                        with measure_time(
+                            perf_metrics,
+                            "prompt_local_dataset_materialize",
+                            enabled=perf_enabled,
+                        ):
+                            for payload in payloads:
+                                payload["prompt"] = (
+                                    self.data_fetcher.get_payload_by_index(
+                                        payload["prompt_idx"],
+                                        is_validation=is_validation,
+                                    )
                                 )
-                            )
+                                payload["conversation"] = (
+                                    self.data_fetcher.get_payload_by_index(
+                                        payload["prompt_idx"],
+                                        is_validation=is_validation,
+                                        attr="conversation",
+                                    )
+                                )
                     payloads = [
                         RLPayload.model_validate(payload) for payload in payloads
                     ]
@@ -1358,7 +1378,12 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 )
 
         # Broadcast the prompts and is_end to all ranks
-        prompts_and_is_end = dist_utils.broadcast_object_cpu(prompts_and_is_end)
+        with measure_time(
+            perf_metrics,
+            "prompt_broadcast_comm",
+            enabled=perf_enabled,
+        ):
+            prompts_and_is_end = dist_utils.broadcast_object_cpu(prompts_and_is_end)
         if self.parallel_dims.mesh["dp"].size() > 1:
             # Scatter the prompts to all data parallel ranks
             prompts, is_end = prompts_and_is_end
@@ -1387,16 +1412,28 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     (None, is_end) for _ in range(self.parallel_dims.mesh["dp"].size())
                 ]
             recv_prompts_and_is_end = [(None, False)]
-            dist.scatter_object_list(
-                recv_prompts_and_is_end,
-                scattered_prompts_and_is_end,
-                group=self.parallel_dims.mesh["dp"].get_group(),
-                group_src=0,
-            )
+            with measure_time(
+                perf_metrics,
+                "prompt_scatter_comm",
+                enabled=perf_enabled,
+            ):
+                dist.scatter_object_list(
+                    recv_prompts_and_is_end,
+                    scattered_prompts_and_is_end,
+                    group=self.parallel_dims.mesh["dp"].get_group(),
+                    group_src=0,
+                )
             prompts_and_is_end = recv_prompts_and_is_end[0]
         prompts, is_end = prompts_and_is_end
         if prompts is not None:
             prompt_queue.put(prompts)
+        if perf_enabled:
+            logger.info(
+                "[Perf][RolloutPrompt] batch=%s prompts=%s %s",
+                batch_size,
+                len(prompts) if prompts is not None else 0,
+                format_perf_metrics(perf_metrics),
+            )
         return is_end
 
     def consume_one_command(self, cmd_pred: Optional[Callable[[Command], bool]] = None):
@@ -1505,10 +1542,17 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         return valid_payloads, metadata
 
     def report_rollouts(self, block=False):
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         while True:
-            payloads, is_validation, step, empty = (
-                self.reward_dispatcher.dequeue_rewards_cal()
-            )
+            with measure_time(
+                perf_metrics,
+                "reward_dequeue_wait",
+                enabled=perf_enabled,
+            ):
+                payloads, is_validation, step, empty = (
+                    self.reward_dispatcher.dequeue_rewards_cal()
+                )
             if payloads is not None:
                 if is_validation:
                     break
@@ -1518,25 +1562,32 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     payloads, metadata_from_dapo = self.dynamic_sampling(payloads)
                     metadata.update(metadata_from_dapo)
 
-                for i in range(len(payloads)):
-                    (
-                        payloads[i].completions,
-                        payloads[i].completed_conversations,
-                        payloads[i].completion_logprobs,
-                        payloads[i].completion_token_ids,
-                        _,
-                    ) = self.data_packer.get_rollout_output(
-                        payloads[i].completions,
-                        payloads[i].completed_conversations,
-                        payloads[i].completion_logprobs,
-                        payloads[i].completion_token_ids,
-                    )
-                    # when using local dataset, we don't need to send the prompt/conversation to the controller
-                    if self.config.train.local_dataset:
-                        payloads[i].prompt = None
-                        payloads[i].conversation = None
-                    if self.config.train.train_policy.rollout_as_token_ids:
-                        payloads[i].completions = [""] * len(payloads[i].completions)
+                with measure_time(
+                    perf_metrics,
+                    "rollout_output_pack",
+                    enabled=perf_enabled,
+                ):
+                    for i in range(len(payloads)):
+                        (
+                            payloads[i].completions,
+                            payloads[i].completed_conversations,
+                            payloads[i].completion_logprobs,
+                            payloads[i].completion_token_ids,
+                            _,
+                        ) = self.data_packer.get_rollout_output(
+                            payloads[i].completions,
+                            payloads[i].completed_conversations,
+                            payloads[i].completion_logprobs,
+                            payloads[i].completion_token_ids,
+                        )
+                        # when using local dataset, we don't need to send the prompt/conversation to the controller
+                        if self.config.train.local_dataset:
+                            payloads[i].prompt = None
+                            payloads[i].conversation = None
+                        if self.config.train.train_policy.rollout_as_token_ids:
+                            payloads[i].completions = [""] * len(
+                                payloads[i].completions
+                            )
 
                 response = RolloutRequest(
                     src_replica_name=self.replica_name,
@@ -1544,9 +1595,20 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     metrics=metadata,
                     is_end=False,
                 )
-                self.api_client.post_rollout_completion(response)
+                with measure_time(
+                    perf_metrics,
+                    "rollout_post_comm",
+                    enabled=perf_enabled,
+                ):
+                    self.api_client.post_rollout_completion(response)
             elif not block or empty:
                 break
+        if perf_enabled:
+            logger.info(
+                "[Perf][RolloutReport] block=%s %s",
+                block,
+                format_perf_metrics(perf_metrics),
+            )
         return payloads, is_validation, step, empty
 
     @torch.no_grad()
@@ -1722,15 +1784,23 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         Perform one step of rollout generation.
         Returns the number of valid payloads generated.
         """
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         payloads_list: List[RLPayload] = self._prompt_queue.get()
 
-        rollout_results: List[RolloutResult] = self.rollout.rollout_generation(
-            payloads=payloads_list,
-            stream=self.inference_stream,
-            data_packer=self.data_packer,
-            data_fetcher=self.data_fetcher,
-            is_validation=False,
-        )
+        with measure_time(
+            perf_metrics,
+            "rollout_generation_compute",
+            enabled=perf_enabled,
+            cuda_device=self.device,
+        ):
+            rollout_results: List[RolloutResult] = self.rollout.rollout_generation(
+                payloads=payloads_list,
+                stream=self.inference_stream,
+                data_packer=self.data_packer,
+                data_fetcher=self.data_fetcher,
+                is_validation=False,
+            )
 
         if len(rollout_results) == 0:
             return False
@@ -1740,10 +1810,21 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         )
 
         logger.debug(f"[Rollout] generate end for rank {self.global_rank}")
-
-        return self._filter_valid_rollout_results_and_report(
-            rollout_results, payloads_list
-        )
+        with measure_time(
+            perf_metrics,
+            "rollout_filter_report",
+            enabled=perf_enabled,
+        ):
+            result = self._filter_valid_rollout_results_and_report(
+                rollout_results, payloads_list
+            )
+        if perf_enabled:
+            logger.info(
+                "[Perf][RolloutStep] prompts=%s %s",
+                len(payloads_list),
+                format_perf_metrics(perf_metrics),
+            )
+        return result
 
     def _stream_generation_feed_prompts(
         self,

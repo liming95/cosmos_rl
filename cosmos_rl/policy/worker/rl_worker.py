@@ -57,6 +57,13 @@ import cosmos_rl.utils.distributed as dist_util
 from cosmos_rl.utils import constant
 from cosmos_rl.policy.worker.base import PolicyWorkerBase
 from cosmos_rl.collective.collective import P2RCollectiveManager
+from cosmos_rl.utils.perf_utils import (
+    format_perf_metrics,
+    inject_perf_metrics,
+    measure_time,
+    new_perf_metrics,
+    stage_perf_enabled,
+)
 
 
 class RLPolicyWorker(PolicyWorkerBase):
@@ -297,24 +304,37 @@ class RLPolicyWorker(PolicyWorkerBase):
         recv = self.replica_name in command.dst_replica_names and not send
         if not send and not recv:
             return True
-        st = time.time()
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         # TODO(zjx): there need failure tolerance for nccl send and recv, so get nccl param from command
         send_recv_hook = partial(
             self.inter_policy_nccl.broadcast, src_replica=command.src_replica_name
         )
-        len_params = self.sync_all_states(
-            is_send=send,
-            send_hook=send_recv_hook,
-            recv_hook=send_recv_hook,
-            reference_model=hasattr(self.config.train.train_policy, "kl_beta")
-            and self.config.train.train_policy.kl_beta != 0.0,
-        )
+        with measure_time(
+            perf_metrics,
+            "p2p_broadcast_total",
+            enabled=perf_enabled,
+            cuda_device=self.device,
+        ):
+            len_params = self.sync_all_states(
+                is_send=send,
+                send_hook=send_recv_hook,
+                recv_hook=send_recv_hook,
+                reference_model=hasattr(self.config.train.train_policy, "kl_beta")
+                and self.config.train.train_policy.kl_beta != 0.0,
+            )
         if recv:
             self.model_ready = True
-        time_eclapsed = time.time() - st
         logger.debug(
-            f"[Policy] Policy2Policy Broadcast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {len(command.dst_replica_names)} replicas took {time_eclapsed:.3f} seconds."
+            f"[Policy] Policy2Policy Broadcast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {len(command.dst_replica_names)} replicas took {perf_metrics['p2p_broadcast_total']:.3f} seconds."
         )
+        if perf_enabled:
+            logger.info(
+                "[Perf][PolicySync][P2PBroadcast] send=%s recv=%s %s",
+                send,
+                recv,
+                format_perf_metrics(perf_metrics),
+            )
         return False
 
     @CommMixin.register_policy_command_handler(PolicyToPolicyUnicastCommand)
@@ -323,7 +343,8 @@ class RLPolicyWorker(PolicyWorkerBase):
         recv = self.replica_name == command.dst_replica_name
         if not send and not recv:
             return False
-        st = time.time()
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         # TODO(zjx): there need failure tolerance for nccl send and recv, so get nccl param from command
         send_hook = partial(
             self.inter_policy_nccl.send, dst_replica=command.dst_replica_name
@@ -331,19 +352,31 @@ class RLPolicyWorker(PolicyWorkerBase):
         recv_hook = partial(
             self.inter_policy_nccl.recv, src_replica=command.src_replica_name
         )
-        len_params = self.sync_all_states(
-            is_send=send,
-            send_hook=send_hook,
-            recv_hook=recv_hook,
-            reference_model=hasattr(self.config.train.train_policy, "kl_beta")
-            and self.config.train.train_policy.kl_beta != 0.0,
-        )
+        with measure_time(
+            perf_metrics,
+            "p2p_unicast_total",
+            enabled=perf_enabled,
+            cuda_device=self.device,
+        ):
+            len_params = self.sync_all_states(
+                is_send=send,
+                send_hook=send_hook,
+                recv_hook=recv_hook,
+                reference_model=hasattr(self.config.train.train_policy, "kl_beta")
+                and self.config.train.train_policy.kl_beta != 0.0,
+            )
         if recv:
             self.model_ready = True
-        time_eclapsed = time.time() - st
         logger.debug(
-            f"[Policy] Policy2Policy Unicast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {command.dst_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.dst_replica_name)}) as sender {send} took {time_eclapsed:.3f} seconds."
+            f"[Policy] Policy2Policy Unicast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {command.dst_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.dst_replica_name)}) as sender {send} took {perf_metrics['p2p_unicast_total']:.3f} seconds."
         )
+        if perf_enabled:
+            logger.info(
+                "[Perf][PolicySync][P2PUnicast] send=%s recv=%s %s",
+                send,
+                recv,
+                format_perf_metrics(perf_metrics),
+            )
         return False
 
     @CommMixin.register_policy_command_handler(PolicyToRolloutUnicastCommand)
@@ -360,13 +393,19 @@ class RLPolicyWorker(PolicyWorkerBase):
         assert self.trainer.map_w_from_policy_to_rollout is not None, (
             "No parameters to sync found."
         )
-        st = time.time()
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
 
         if self.policy_to_rollout_insts is None:
             self.policy_to_rollout_insts = []
-            self.policy_to_rollout_insts = self.api_client.post_policy_shard_send_insts(
-                self.global_rank
-            )
+            with measure_time(
+                perf_metrics,
+                "p2r_fetch_instructions",
+                enabled=perf_enabled,
+            ):
+                self.policy_to_rollout_insts = (
+                    self.api_client.post_policy_shard_send_insts(self.global_rank)
+                )
         # sort the param list by the dest_name, same as rollout
         total_bytes_sent = 0
         # There is a local-replica comm in training step
@@ -391,9 +430,15 @@ class RLPolicyWorker(PolicyWorkerBase):
                         # FIXME: (lms) move this to the trainer
                         merge_lora_weights_(self.trainer.model)
 
-                    pre_P2R_collected_tensors: Dict[str, torch.Tensor] = (
-                        self.pre_P2R_collect_parameters()
-                    )
+                    with measure_time(
+                        perf_metrics,
+                        "p2r_precollect",
+                        enabled=perf_enabled,
+                        cuda_device=self.device,
+                    ):
+                        pre_P2R_collected_tensors: Dict[str, torch.Tensor] = (
+                            self.pre_P2R_collect_parameters()
+                        )
 
                     def grouped_send(grouped_send_ops):
                         if (
@@ -402,13 +447,19 @@ class RLPolicyWorker(PolicyWorkerBase):
                         ):
                             # Only in non-colocated-separated mode, we could use NCCL group feature.
                             nccl_group_start(comm_id)
-                        for view, r_rank, dest_name in grouped_send_ops:
-                            logger.debug(
-                                f"[Policy] Sending tensor {dest_name} from policy rank {self.global_rank} to rollout rank {r_rank}, shape {view.shape} with dtype: {view.dtype}."
-                            )
-                            self.p2r_collective_manager.send(
-                                base_mesh_key, view, r_rank
-                            )
+                        with measure_time(
+                            perf_metrics,
+                            "p2r_send_comm",
+                            enabled=perf_enabled,
+                            cuda_device=self.device,
+                        ):
+                            for view, r_rank, dest_name in grouped_send_ops:
+                                logger.debug(
+                                    f"[Policy] Sending tensor {dest_name} from policy rank {self.global_rank} to rollout rank {r_rank}, shape {view.shape} with dtype: {view.dtype}."
+                                )
+                                self.p2r_collective_manager.send(
+                                    base_mesh_key, view, r_rank
+                                )
                         if (
                             self.rl_mode != "colocated_separated"
                             and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
@@ -455,14 +506,22 @@ class RLPolicyWorker(PolicyWorkerBase):
                                     local_view = local_view()
                                 else:
                                     pass
-                                local_view = local_view.to(
-                                    str2torch_dtype(self.config.train.transfer_dtype)
-                                )
-                                view = (
-                                    local_view.cosmos_slice(tensor_split_strategys)
-                                    .contiguous()
-                                    .cuda()
-                                )
+                                with measure_time(
+                                    perf_metrics,
+                                    "p2r_prepare_tensor",
+                                    enabled=perf_enabled,
+                                    cuda_device=self.device,
+                                ):
+                                    local_view = local_view.to(
+                                        str2torch_dtype(
+                                            self.config.train.transfer_dtype
+                                        )
+                                    )
+                                    view = (
+                                        local_view.cosmos_slice(tensor_split_strategys)
+                                        .contiguous()
+                                        .cuda()
+                                    )
                                 assert self.global_rank == p_rank
                                 logger.debug(
                                     f"[Policy] Sending {dest_name} from policy rank {self.global_rank} to rollout rank {r_rank}, {view.shape} with dtype: {view.dtype}."
@@ -489,11 +548,25 @@ class RLPolicyWorker(PolicyWorkerBase):
                             "Trainable synced params count must match at each weight sync."
                         )
 
-        # make sure all the send operations of all ranks are finished
-        time_eclapsed = time.time() - st
+        if perf_enabled:
+            perf_metrics["p2r_total"] = (
+                perf_metrics["p2r_fetch_instructions"]
+                + perf_metrics["p2r_precollect"]
+                + perf_metrics["p2r_prepare_tensor"]
+                + perf_metrics["p2r_send_comm"]
+            )
         logger.debug(
-            f"[Policy] All {len(self.policy_to_rollout_insts)} at step {command.weight_step} send operations of finished in {time_eclapsed:.3f} seconds with {total_bytes_sent / (1024 * 1024)} MB sent. While {skipped_params_cnt} non-trainable splitted params skipped and {transferred_params_cnt} splitted params transferred."
+            f"[Policy] All {len(self.policy_to_rollout_insts)} at step {command.weight_step} send operations of finished in {perf_metrics['p2r_total'] if perf_enabled else 0.0:.3f} seconds with {total_bytes_sent / (1024 * 1024)} MB sent. While {skipped_params_cnt} non-trainable splitted params skipped and {transferred_params_cnt} splitted params transferred."
         )
+        if perf_enabled:
+            logger.info(
+                "[Perf][PolicySync][P2R] step=%s bytes_mb=%.3f transferred=%s skipped=%s %s",
+                command.weight_step,
+                total_bytes_sent / (1024 * 1024),
+                transferred_params_cnt,
+                skipped_params_cnt,
+                format_perf_metrics(perf_metrics),
+            )
         return False
 
     @CommMixin.register_policy_command_handler(WeightResumeCommand)
@@ -509,6 +582,8 @@ class RLPolicyWorker(PolicyWorkerBase):
 
     @CommMixin.register_policy_command_handler(DataFetchCommand)
     def execute_data_fetch(self, command: DataFetchCommand):
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
         if command.do_profile:
             self.profiler.start_dynamic(
                 active_steps=command.active_steps,
@@ -536,15 +611,27 @@ class RLPolicyWorker(PolicyWorkerBase):
                 self.signal_handled = True
 
             self.trainer.update_lr_schedulers(command.total_steps)
-            report_data = self.trainer.step_training(
-                rollouts=self.dispatch_rollouts(),
-                current_step=command.global_step,
-                total_steps=command.total_steps,
-                remain_samples_num=command.remain_samples_num,
-                do_save_checkpoint=do_save_checkpoint,
-                inter_policy_nccl=self.inter_policy_nccl,
-                is_master_replica=self.is_master_replica,
-            )
+            with measure_time(
+                perf_metrics,
+                "dispatch_rollouts",
+                enabled=perf_enabled,
+            ):
+                dispatched_rollouts = self.dispatch_rollouts()
+            with measure_time(
+                perf_metrics,
+                "trainer_step_total",
+                enabled=perf_enabled,
+                cuda_device=self.device,
+            ):
+                report_data = self.trainer.step_training(
+                    rollouts=dispatched_rollouts,
+                    current_step=command.global_step,
+                    total_steps=command.total_steps,
+                    remain_samples_num=command.remain_samples_num,
+                    do_save_checkpoint=do_save_checkpoint,
+                    inter_policy_nccl=self.inter_policy_nccl,
+                    is_master_replica=self.is_master_replica,
+                )
         else:
             report_data = {}
             logger.info(
@@ -556,15 +643,29 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         # Train ACK
         if is_master_rank(self.parallel_dims, self.global_rank):
-            self.api_client.post_policy_train_ack(
-                self.replica_name,
-                command.global_step,
-                command.total_steps,
-                self.profiler.check_finished(),
-                report_data,
-            )
+            if perf_enabled:
+                inject_perf_metrics(report_data, perf_metrics, prefix="perf/policy")
+            with measure_time(
+                perf_metrics,
+                "train_ack_post",
+                enabled=perf_enabled,
+            ):
+                self.api_client.post_policy_train_ack(
+                    self.replica_name,
+                    command.global_step,
+                    command.total_steps,
+                    self.profiler.check_finished(),
+                    report_data,
+                )
 
         logger.debug(f"[Policy] Train ack sent for global step {command.global_step}.")
+        if perf_enabled:
+            logger.info(
+                "[Perf][PolicyTrain] step=%s fake_step=%s %s",
+                command.global_step,
+                is_fake_step,
+                format_perf_metrics(perf_metrics),
+            )
         return command.replica_should_stop()
 
     async def fetch_command(self):
@@ -675,6 +776,9 @@ class RLPolicyWorker(PolicyWorkerBase):
         return prefetch_dp_id
 
     def dispatch_rollouts(self) -> List[Rollout]:
+        perf_enabled = stage_perf_enabled()
+        perf_metrics = new_perf_metrics()
+
         def preprocess_rollouts(rollouts: List[Rollout]) -> List[Rollout]:
             """
             Processing rollouts that retrieved from the controller,
@@ -685,27 +789,34 @@ class RLPolicyWorker(PolicyWorkerBase):
             assert all(rollout.prompt_idx >= 0 for rollout in rollouts), (
                 "All rollouts from controller should have a valid prompt index"
             )
-            for i in range(len(rollouts)):
-                if self.config.train.local_dataset:
-                    if self.config.train.train_policy.data_dispatch_as_rank_in_mesh:
-                        for rollout in rollouts:
-                            assert (
-                                rollout.prompt_idx
-                                % len(self.inter_policy_nccl.replica_name_to_rank)
-                                == self.inter_policy_nccl.replica_name_to_rank[
-                                    self.replica_name
-                                ]
-                            ), (
-                                f"Rollout prompt idx {rollout.prompt_idx} mod {len(self.inter_policy_nccl.replica_name_to_rank)} must be equal to replica rank {self.inter_policy_nccl.replica_name_to_rank[self.replica_name]} in mesh."
+            with measure_time(
+                perf_metrics,
+                "dispatch_preprocess_local_dataset",
+                enabled=perf_enabled,
+            ):
+                for i in range(len(rollouts)):
+                    if self.config.train.local_dataset:
+                        if self.config.train.train_policy.data_dispatch_as_rank_in_mesh:
+                            for rollout in rollouts:
+                                assert (
+                                    rollout.prompt_idx
+                                    % len(self.inter_policy_nccl.replica_name_to_rank)
+                                    == self.inter_policy_nccl.replica_name_to_rank[
+                                        self.replica_name
+                                    ]
+                                ), (
+                                    f"Rollout prompt idx {rollout.prompt_idx} mod {len(self.inter_policy_nccl.replica_name_to_rank)} must be equal to replica rank {self.inter_policy_nccl.replica_name_to_rank[self.replica_name]} in mesh."
+                                )
+                        # Populate the prompt and conversation from the local dataset
+                        rollouts[i].prompt = self.data_fetcher.get_payload_by_index(
+                            rollouts[i].prompt_idx
+                        )
+                        rollouts[i].conversation = (
+                            self.data_fetcher.get_payload_by_index(
+                                rollouts[i].prompt_idx,
+                                attr="conversation",
                             )
-                    # Populate the prompt and conversation from the local dataset
-                    rollouts[i].prompt = self.data_fetcher.get_payload_by_index(
-                        rollouts[i].prompt_idx
-                    )
-                    rollouts[i].conversation = self.data_fetcher.get_payload_by_index(
-                        rollouts[i].prompt_idx,
-                        attr="conversation",
-                    )
+                        )
             return rollouts
 
         rollouts = [[]]
@@ -717,12 +828,17 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         if self.config.train.train_policy.uncentralized_training:
             for _ in range(batch_for_this_step // self.dp_world_size):
-                try:
-                    rollout = self.data_queue.get(block=True, timeout=None)
-                except Empty:
-                    raise Empty(
-                        "[Policy] Rollouts queue is empty, please check the dispatcher."
-                    )
+                with measure_time(
+                    perf_metrics,
+                    "dispatch_queue_wait",
+                    enabled=perf_enabled,
+                ):
+                    try:
+                        rollout = self.data_queue.get(block=True, timeout=None)
+                    except Empty:
+                        raise Empty(
+                            "[Policy] Rollouts queue is empty, please check the dispatcher."
+                        )
                 rollouts[0].append(rollout)
             # TODO(dinghaoy): Support distillation in decentralized training
         else:
@@ -730,15 +846,25 @@ class RLPolicyWorker(PolicyWorkerBase):
                 dp_id = 0
                 prefetch_dp_id = 0
                 for _ in range(batch_for_this_step):
-                    try:
-                        rollout = self.data_queue.get(block=True, timeout=None)
-                    except Empty:
-                        raise Empty(
-                            "[Policy] Rollouts queue is empty, please check the dispatcher."
+                    with measure_time(
+                        perf_metrics,
+                        "dispatch_queue_wait",
+                        enabled=perf_enabled,
+                    ):
+                        try:
+                            rollout = self.data_queue.get(block=True, timeout=None)
+                        except Empty:
+                            raise Empty(
+                                "[Policy] Rollouts queue is empty, please check the dispatcher."
+                            )
+                    with measure_time(
+                        perf_metrics,
+                        "dispatch_teacher_prefetch",
+                        enabled=perf_enabled,
+                    ):
+                        prefetch_dp_id = self.prepare_teacher_uuids_for_prefetch(
+                            prefetch_dp_id, batch_for_this_step
                         )
-                    prefetch_dp_id = self.prepare_teacher_uuids_for_prefetch(
-                        prefetch_dp_id, batch_for_this_step
-                    )
                     if rollout.teacher_result_uuid:
                         assert (
                             self.teacher_uuid_to_dp_shard.pop(
@@ -757,14 +883,35 @@ class RLPolicyWorker(PolicyWorkerBase):
                 self.prepare_teacher_uuids_for_prefetch(0, batch_for_this_step)
 
             if self.world_size == 1:
-                return preprocess_rollouts(scattered_rollouts[0])
+                result = preprocess_rollouts(scattered_rollouts[0])
+                if perf_enabled:
+                    logger.info(
+                        "[Perf][PolicyDispatch] batch=%s world_size=%s %s",
+                        len(result),
+                        self.world_size,
+                        format_perf_metrics(perf_metrics),
+                    )
+                return result
 
-            dist.scatter_object_list(
-                rollouts,
-                scattered_rollouts,
-                src=0,
+            with measure_time(
+                perf_metrics,
+                "dispatch_scatter_comm",
+                enabled=perf_enabled,
+            ):
+                dist.scatter_object_list(
+                    rollouts,
+                    scattered_rollouts,
+                    src=0,
+                )
+        result = preprocess_rollouts(rollouts[0])
+        if perf_enabled:
+            logger.info(
+                "[Perf][PolicyDispatch] batch=%s world_size=%s %s",
+                len(result),
+                self.world_size,
+                format_perf_metrics(perf_metrics),
             )
-        return preprocess_rollouts(rollouts[0])
+        return result
 
     def teacher_interact_loop(self):
         """Background task to interact with teacher model for distillation"""
