@@ -67,32 +67,54 @@ def accumulate_perf_metrics(
         total_metrics[key] += float(value)
 
 
+def accumulate_perf_metric_counts(
+    total_counts: DefaultDict[str, int],
+    step_metrics: Dict[str, float] | DefaultDict[str, float],
+) -> None:
+    for key in step_metrics.keys():
+        total_counts[key] += 1
+
+
 def inject_perf_summary(
     target: Dict[str, float],
     total_metrics: Dict[str, float] | DefaultDict[str, float],
     *,
     prefix: str,
     count: int,
+    metric_counts: Dict[str, int] | DefaultDict[str, int] | None = None,
 ) -> None:
     count = max(int(count), 1)
     target[f"{prefix}/count"] = float(count)
     for key, value in total_metrics.items():
         value = float(value)
+        per_metric_count = (
+            max(int(metric_counts.get(key, 0)), 1)
+            if metric_counts is not None
+            else count
+        )
+        target[f"{prefix}/metric_count/{key}"] = float(per_metric_count)
         target[f"{prefix}/total/{key}"] = value
-        target[f"{prefix}/avg/{key}"] = value / count
+        target[f"{prefix}/avg/{key}"] = value / per_metric_count
 
 
 def summarize_perf_metrics(
     total_metrics: Dict[str, float] | DefaultDict[str, float],
     *,
     count: int,
+    metric_counts: Dict[str, int] | DefaultDict[str, int] | None = None,
 ) -> Dict[str, float]:
     count = max(int(count), 1)
     summary: Dict[str, float] = {"count": float(count)}
     for key, value in total_metrics.items():
         value = float(value)
+        per_metric_count = (
+            max(int(metric_counts.get(key, 0)), 1)
+            if metric_counts is not None
+            else count
+        )
+        summary[f"metric_count/{key}"] = float(per_metric_count)
         summary[f"total/{key}"] = value
-        summary[f"avg/{key}"] = value / count
+        summary[f"avg/{key}"] = value / per_metric_count
     return summary
 
 

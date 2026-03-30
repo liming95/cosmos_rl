@@ -18,6 +18,7 @@ import threading
 import uuid
 import torch
 import atexit
+from collections import defaultdict
 
 import torch.distributed as dist
 
@@ -76,6 +77,7 @@ from cosmos_rl.dispatcher.data.data_fetcher import WorkerDataFetcher
 from cosmos_rl.collective.collective import P2RCollectiveManager
 from cosmos_rl.utils.perf_utils import (
     accumulate_perf_metrics,
+    accumulate_perf_metric_counts,
     append_perf_summary,
     format_perf_metrics,
     measure_time,
@@ -119,6 +121,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         self.current_weight_version = 0
         self.perf_totals = new_perf_metrics()
         self.perf_counts = {}
+        self.perf_metric_counts = defaultdict(int)
         self._perf_summary_emitted = False
 
         # determine the quantization type
@@ -375,8 +378,10 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             "rollout_worker": summarize_perf_metrics(
                 self.perf_totals,
                 count=sum(self.perf_counts.values()),
+                metric_counts=self.perf_metric_counts,
             ),
             "rollout_counts": dict(self.perf_counts),
+            "rollout_metric_counts": dict(self.perf_metric_counts),
         }
         summary_path = write_perf_summary(
             self.config.train.output_dir,
@@ -1467,6 +1472,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             prompt_queue.put(prompts)
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_prompt"] = (
                 self.perf_counts.get("rollout_prompt", 0) + 1
             )
@@ -1648,6 +1654,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 break
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_report"] = (
                 self.perf_counts.get("rollout_report", 0) + 1
             )
@@ -1868,6 +1875,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             )
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_step"] = (
                 self.perf_counts.get("rollout_step", 0) + 1
             )

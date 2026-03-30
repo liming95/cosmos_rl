@@ -19,6 +19,7 @@ import time
 import msgpack
 import asyncio
 import threading
+from collections import defaultdict
 from functools import partial
 from typing import List, Optional, Union, Callable, Dict
 from torch.utils.data import Dataset
@@ -59,6 +60,7 @@ from cosmos_rl.policy.worker.base import PolicyWorkerBase
 from cosmos_rl.collective.collective import P2RCollectiveManager
 from cosmos_rl.utils.perf_utils import (
     accumulate_perf_metrics,
+    accumulate_perf_metric_counts,
     append_perf_summary,
     format_perf_metrics,
     inject_perf_metrics,
@@ -90,6 +92,7 @@ class RLPolicyWorker(PolicyWorkerBase):
         self.upload_thread = None
         self.perf_totals = new_perf_metrics()
         self.perf_counts: Dict[str, int] = {}
+        self.perf_metric_counts = defaultdict(int)
         self._perf_summary_emitted = False
 
         # Model Status related
@@ -281,8 +284,10 @@ class RLPolicyWorker(PolicyWorkerBase):
             "policy_worker": summarize_perf_metrics(
                 self.perf_totals,
                 count=sum(self.perf_counts.values()),
+                metric_counts=self.perf_metric_counts,
             ),
             "policy_counts": dict(self.perf_counts),
+            "policy_metric_counts": dict(self.perf_metric_counts),
         }
 
         trainer_totals = getattr(self.trainer, "_perf_train_totals", None)
@@ -291,8 +296,12 @@ class RLPolicyWorker(PolicyWorkerBase):
             payload["trainer"] = summarize_perf_metrics(
                 trainer_totals,
                 count=trainer_count,
+                metric_counts=getattr(self.trainer, "_perf_train_metric_counts", None),
             )
             payload["trainer_count"] = trainer_count
+            payload["trainer_metric_counts"] = dict(
+                getattr(self.trainer, "_perf_train_metric_counts", {})
+            )
 
         summary_path = write_perf_summary(
             self.config.train.output_dir,
@@ -379,6 +388,7 @@ class RLPolicyWorker(PolicyWorkerBase):
         )
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2p_broadcast"] = (
                 self.perf_counts.get("p2p_broadcast", 0) + 1
             )
@@ -426,6 +436,7 @@ class RLPolicyWorker(PolicyWorkerBase):
         )
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2p_unicast"] = (
                 self.perf_counts.get("p2p_unicast", 0) + 1
             )
@@ -615,6 +626,7 @@ class RLPolicyWorker(PolicyWorkerBase):
                 + perf_metrics["p2r_send_comm"]
             )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2r"] = self.perf_counts.get("p2r", 0) + 1
         logger.debug(
             f"[Policy] All {len(self.policy_to_rollout_insts)} at step {command.weight_step} send operations of finished in {perf_metrics['p2r_total'] if perf_enabled else 0.0:.3f} seconds with {total_bytes_sent / (1024 * 1024)} MB sent. While {skipped_params_cnt} non-trainable splitted params skipped and {transferred_params_cnt} splitted params transferred."
@@ -712,6 +724,7 @@ class RLPolicyWorker(PolicyWorkerBase):
                     self.perf_totals,
                     prefix="perf/policy_summary",
                     count=self.perf_counts.get("policy_train", 0) + 1,
+                    metric_counts=self.perf_metric_counts,
                 )
             with measure_time(
                 perf_metrics,
@@ -729,6 +742,7 @@ class RLPolicyWorker(PolicyWorkerBase):
         logger.debug(f"[Policy] Train ack sent for global step {command.global_step}.")
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["policy_train"] = (
                 self.perf_counts.get("policy_train", 0) + 1
             )
@@ -959,6 +973,9 @@ class RLPolicyWorker(PolicyWorkerBase):
                 result = preprocess_rollouts(scattered_rollouts[0])
                 if perf_enabled:
                     accumulate_perf_metrics(self.perf_totals, perf_metrics)
+                    accumulate_perf_metric_counts(
+                        self.perf_metric_counts, perf_metrics
+                    )
                     self.perf_counts["policy_dispatch"] = (
                         self.perf_counts.get("policy_dispatch", 0) + 1
                     )
@@ -984,6 +1001,7 @@ class RLPolicyWorker(PolicyWorkerBase):
         result = preprocess_rollouts(rollouts[0])
         if perf_enabled:
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
+            accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["policy_dispatch"] = (
                 self.perf_counts.get("policy_dispatch", 0) + 1
             )

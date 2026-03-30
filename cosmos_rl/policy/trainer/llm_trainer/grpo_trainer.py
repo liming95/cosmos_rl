@@ -17,6 +17,7 @@ import os
 import time
 import torch
 import types
+from collections import defaultdict
 from functools import partial
 import inspect
 import numpy as np
@@ -40,6 +41,7 @@ from cosmos_rl.utils.util import (
 )
 from cosmos_rl.utils.perf_utils import (
     accumulate_perf_metrics,
+    accumulate_perf_metric_counts,
     inject_perf_metrics,
     inject_perf_summary,
     measure_time,
@@ -963,6 +965,7 @@ class GRPOTrainer(LLMTrainer):
         if not hasattr(self, "_perf_train_totals"):
             self._perf_train_totals = new_perf_metrics()
             self._perf_train_count = 0
+            self._perf_train_metric_counts = defaultdict(int)
         pp_last_stage = (
             self.parallel_dims.pp_coord[0] == self.parallel_dims.pp_coord[1] - 1
         )
@@ -1958,6 +1961,9 @@ class GRPOTrainer(LLMTrainer):
         if perf_enabled:
             perf_metrics["step_total_wall"] += time.perf_counter() - step_wall_start
             accumulate_perf_metrics(self._perf_train_totals, perf_metrics)
+            accumulate_perf_metric_counts(
+                self._perf_train_metric_counts, perf_metrics
+            )
             self._perf_train_count += 1
             if is_master_rank(self.parallel_dims, self.global_rank):
                 inject_perf_metrics(report_data, perf_metrics, prefix="perf/train")
@@ -1966,6 +1972,7 @@ class GRPOTrainer(LLMTrainer):
                     self._perf_train_totals,
                     prefix="perf/train_summary",
                     count=self._perf_train_count,
+                    metric_counts=self._perf_train_metric_counts,
                 )
             logger.info(
                 "[Perf][GRPOTrain] step=%s step={%s} total={%s}",
