@@ -387,6 +387,9 @@ class RLPolicyWorker(PolicyWorkerBase):
             f"[Policy] Policy2Policy Broadcast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {len(command.dst_replica_names)} replicas took {perf_metrics['p2p_broadcast_total']:.3f} seconds."
         )
         if perf_enabled:
+            perf_metrics["p2p_broadcast_stage_total"] = perf_metrics.get(
+                "p2p_broadcast_total", 0.0
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2p_broadcast"] = (
@@ -435,6 +438,9 @@ class RLPolicyWorker(PolicyWorkerBase):
             f"[Policy] Policy2Policy Unicast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {command.dst_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.dst_replica_name)}) as sender {send} took {perf_metrics['p2p_unicast_total']:.3f} seconds."
         )
         if perf_enabled:
+            perf_metrics["p2p_unicast_stage_total"] = perf_metrics.get(
+                "p2p_unicast_total", 0.0
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2p_unicast"] = (
@@ -625,6 +631,7 @@ class RLPolicyWorker(PolicyWorkerBase):
                 + perf_metrics["p2r_prepare_tensor"]
                 + perf_metrics["p2r_send_comm"]
             )
+            perf_metrics["p2r_stage_total"] = perf_metrics["p2r_total"]
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["p2r"] = self.perf_counts.get("p2r", 0) + 1
@@ -741,6 +748,11 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         logger.debug(f"[Policy] Train ack sent for global step {command.global_step}.")
         if perf_enabled:
+            perf_metrics["policy_train_total"] = (
+                perf_metrics.get("dispatch_rollouts", 0.0)
+                + perf_metrics.get("trainer_step_total", 0.0)
+                + perf_metrics.get("train_ack_post", 0.0)
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["policy_train"] = (

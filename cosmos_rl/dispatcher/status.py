@@ -131,6 +131,9 @@ class PolicyStatusManager:
         # Record filter rewards distribution for dynamic sampling
         self.filter_records = {}
 
+        # Controller-side cycle timing keyed by train step.
+        self.step_perf: Dict[int, Dict[str, float]] = {}
+
         # For rank specific data dispatch
         self.rollout_buffer_per_rank: List[Queue] = []
 
@@ -733,6 +736,12 @@ class PolicyStatusManager:
         Dispatch the rollout to the policy replicas in a round-robin manner.
         It is that replica's responsibility to dispatch the rollout to further (DP_SHARD) atoms.
         """
+        perf_now = time.perf_counter()
+        candidate_step = rollout.weight_version + 1
+        step_perf = self.step_perf.setdefault(candidate_step, {})
+        step_perf.setdefault("cycle_start", perf_now)
+        step_perf.setdefault("first_rollout_at", perf_now)
+
         if self.config.rollout.include_stop_str_in_output:
             if self.tokenizer.eos_token is not None and rollout.completion is not None:
                 if not rollout.completion.endswith(self.tokenizer.eos_token):
@@ -944,12 +953,17 @@ class PolicyStatusManager:
         self.set_status(replica_name, PolicyStatus.REDUCED)
 
         if self.all_reduced():
+            perf_now = time.perf_counter()
             self.samples_on_the_fly -= self.config.train.train_batch_per_replica * len(
                 self.get_all_atoms_arrived_replicas()
             )
             assert self.samples_on_the_fly >= 0, (
                 "samples_on_the_fly should not be negative"
             )
+            step_perf = self.step_perf.setdefault(step, {})
+            cycle_start = step_perf.get("cycle_start", perf_now)
+            train_dispatch_at = step_perf.get("train_dispatch_at", perf_now)
+            step_perf["train_wait_total"] = perf_now - train_dispatch_at
             # All replicas have been reduced, trigger allreduce
             need_sync_weight = step % self.config.train.sync_weight_interval == 0
             # If the current step is the last step, we need to sync weight always to act as ending signal
@@ -1022,6 +1036,12 @@ class PolicyStatusManager:
                         "train/entropy": total_entropy,
                         "train/effective_entropy": total_effective_entropy,
                         "train/total_steps": total_steps,
+                        "controller/rollout_collect_total": step_perf.get(
+                            "rollout_collect_total", 0.0
+                        ),
+                        "controller/train_wait_total": step_perf.get(
+                            "train_wait_total", 0.0
+                        ),
                     }
                     policy_report_data = aggregate_report_data(
                         self.report_data_list, policy_report_data
@@ -1141,9 +1161,41 @@ class PolicyStatusManager:
 
             # P->R & R->R
             if need_sync_weight:
+                sync_issue_start = time.perf_counter()
                 self.trigger_weight_sync(
                     any_loaded_replica, rollout_status_manager, step, total_steps
                 )
+                step_perf["sync_issue_total"] = (
+                    time.perf_counter() - sync_issue_start
+                )
+            else:
+                step_perf["sync_issue_total"] = 0.0
+            step_perf["cycle_total_to_sync_issue"] = time.perf_counter() - cycle_start
+            self.train_report_data.setdefault(step, {}).update(
+                {
+                    "controller/rollout_collect_total": step_perf.get(
+                        "rollout_collect_total", 0.0
+                    ),
+                    "controller/train_wait_total": step_perf.get(
+                        "train_wait_total", 0.0
+                    ),
+                    "controller/sync_issue_total": step_perf.get(
+                        "sync_issue_total", 0.0
+                    ),
+                    "controller/cycle_total_to_sync_issue": step_perf.get(
+                        "cycle_total_to_sync_issue", 0.0
+                    ),
+                }
+            )
+            logger.info(
+                "[Perf][ControllerCycle] step=%s rollout_collect=%.4fs train_wait=%.4fs sync_issue=%.4fs cycle_total=%.4fs",
+                step,
+                step_perf.get("rollout_collect_total", 0.0),
+                step_perf.get("train_wait_total", 0.0),
+                step_perf.get("sync_issue_total", 0.0),
+                step_perf.get("cycle_total_to_sync_issue", 0.0),
+            )
+            self.step_perf.pop(step, None)
             # Trigger next step training if data is available
             self.try_trigger_data_fetch_and_training()
             if self.config.train.train_policy.on_policy:
@@ -1273,12 +1325,18 @@ class PolicyStatusManager:
         # If the last command is fake, we need to trigger data fetch and training no matter
         # whether there are enough rollouts or whether replicas are `ready` or `reduced`.
         if all_ready_or_reduced:
+            perf_now = time.perf_counter()
             rollouts_of_this_step: List[Rollout] = []
             # Decrease the consumed rollouts number.
             self.remain_samples_num -= required_rollouts
 
             # From controller's perspective, the training step is already increased
             self.current_step += 1
+            step_perf = self.step_perf.setdefault(self.current_step, {})
+            cycle_start = step_perf.get("cycle_start", perf_now)
+            step_perf.setdefault("cycle_start", cycle_start)
+            step_perf["train_dispatch_at"] = perf_now
+            step_perf["rollout_collect_total"] = perf_now - cycle_start
 
             if self.config.validation.enable and (
                 self.current_step % self.config.validation.freq == 0

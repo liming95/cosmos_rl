@@ -1471,6 +1471,12 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if prompts is not None:
             prompt_queue.put(prompts)
         if perf_enabled:
+            perf_metrics["rollout_prompt_total"] = (
+                perf_metrics.get("prompt_fetch_api", 0.0)
+                + perf_metrics.get("prompt_local_dataset_materialize", 0.0)
+                + perf_metrics.get("prompt_broadcast_comm", 0.0)
+                + perf_metrics.get("prompt_scatter_comm", 0.0)
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_prompt"] = (
@@ -1653,6 +1659,11 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             elif not block or empty:
                 break
         if perf_enabled:
+            perf_metrics["rollout_report_total"] = (
+                perf_metrics.get("reward_dequeue_wait", 0.0)
+                + perf_metrics.get("rollout_output_pack", 0.0)
+                + perf_metrics.get("rollout_post_comm", 0.0)
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_report"] = (
@@ -1874,6 +1885,10 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 rollout_results, payloads_list
             )
         if perf_enabled:
+            perf_metrics["rollout_step_total"] = (
+                perf_metrics.get("rollout_generation_compute", 0.0)
+                + perf_metrics.get("rollout_filter_report", 0.0)
+            )
             accumulate_perf_metrics(self.perf_totals, perf_metrics)
             accumulate_perf_metric_counts(self.perf_metric_counts, perf_metrics)
             self.perf_counts["rollout_step"] = (
