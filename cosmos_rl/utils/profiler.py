@@ -17,6 +17,7 @@
 import concurrent.futures as futures
 from typing import List
 import os
+import json
 import torch
 from functools import partial
 
@@ -225,10 +226,70 @@ class CosmosProfiler:
             )
             # save the trace asynchronously
             self.profiler.export_chrome_trace(trace_file_path)
+            self._save_trace_summaries(trace_file_path)
 
             # report to the controller
             # only report the dir
             self.report_to_controller(os.path.dirname(trace_file_path))
+
+    def _save_trace_summaries(self, trace_file_path: str):
+        if not self.check():
+            return
+
+        summary_prefix = os.path.splitext(os.path.splitext(trace_file_path)[0])[0]
+        key_avg = self.profiler.key_averages()
+
+        tables = {
+            "cuda": key_avg.table(
+                sort_by="self_cuda_time_total",
+                row_limit=200,
+            ),
+            "cpu": key_avg.table(
+                sort_by="self_cpu_time_total",
+                row_limit=200,
+            ),
+        }
+        for metric_name, table in tables.items():
+            summary_path = f"{summary_prefix}_{metric_name}_summary.txt"
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write(table)
+                f.write("\n")
+
+        events = []
+        for event in key_avg:
+            event_dict = {
+                "key": event.key,
+                "count": int(event.count),
+                "cpu_time_total_us": float(event.cpu_time_total),
+                "self_cpu_time_total_us": float(event.self_cpu_time_total),
+            }
+            if hasattr(event, "cuda_time_total"):
+                event_dict["cuda_time_total_us"] = float(event.cuda_time_total)
+            if hasattr(event, "self_cuda_time_total"):
+                event_dict["self_cuda_time_total_us"] = float(
+                    event.self_cuda_time_total
+                )
+            if hasattr(event, "cpu_memory_usage"):
+                event_dict["cpu_memory_usage"] = int(event.cpu_memory_usage)
+            if hasattr(event, "self_cpu_memory_usage"):
+                event_dict["self_cpu_memory_usage"] = int(
+                    event.self_cpu_memory_usage
+                )
+            if hasattr(event, "cuda_memory_usage"):
+                event_dict["cuda_memory_usage"] = int(event.cuda_memory_usage)
+            if hasattr(event, "self_cuda_memory_usage"):
+                event_dict["self_cuda_memory_usage"] = int(
+                    event.self_cuda_memory_usage
+                )
+            events.append(event_dict)
+
+        events.sort(
+            key=lambda item: item.get("self_cuda_time_total_us", 0.0),
+            reverse=True,
+        )
+        events_path = f"{summary_prefix}_key_averages.json"
+        with open(events_path, "w", encoding="utf-8") as f:
+            json.dump(events, f, indent=2, ensure_ascii=False)
 
     def report_to_controller(self, trace_file_dir: str):
         abs_path = os.path.abspath(trace_file_dir)

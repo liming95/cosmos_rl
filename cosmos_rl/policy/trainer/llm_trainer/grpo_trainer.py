@@ -1031,20 +1031,24 @@ class GRPOTrainer(LLMTrainer):
             "prepare_policy_inputs",
             enabled=perf_enabled,
         ):
-            processed_samples: List[Any] = []
-            for i in range(len(samples)):
-                with measure_time(
-                    perf_metrics,
-                    f"prepare_policy_inputs/input_{i}",
-                    enabled=perf_enabled,
-                ):
-                    processed_samples.append(
-                        self.data_packer.get_policy_input(
-                            samples[i],
-                            completions_list[i],
-                            n_ignore_prefix_tokens_list[i],
-                        )
-                    )
+            with torch.profiler.record_function("grpo.prepare_policy_inputs"):
+                processed_samples: List[Any] = []
+                for i in range(len(samples)):
+                    with torch.profiler.record_function(
+                        f"grpo.prepare_policy_inputs.input_{i}"
+                    ):
+                        with measure_time(
+                            perf_metrics,
+                            f"prepare_policy_inputs/input_{i}",
+                            enabled=perf_enabled,
+                        ):
+                            processed_samples.append(
+                                self.data_packer.get_policy_input(
+                                    samples[i],
+                                    completions_list[i],
+                                    n_ignore_prefix_tokens_list[i],
+                                )
+                            )
 
         # On-policy Distillation related computations
         assert len(processed_samples) == len(rollouts) and len(samples) == len(
@@ -1111,6 +1115,7 @@ class GRPOTrainer(LLMTrainer):
         for phase in trainer_phases:
             phase_metric_key = f"phase_{phase.value}"
             phase_metric_prefix = f"{phase_metric_key}/"
+            profiler_phase_name = f"grpo.{phase_metric_key}"
             is_computing_ref = phase == TrainerPhase.REF_COMPUTE
             is_computing_old_ahead = phase == TrainerPhase.OLD_LOGP_COMPUTE
             # Set model to eval mode if reference model is being used
@@ -1131,93 +1136,98 @@ class GRPOTrainer(LLMTrainer):
                 enabled=perf_enabled,
                 cuda_device=self.device,
             ):
-                with torch.set_grad_enabled(phase == TrainerPhase.TRAIN):
-                    for i_mu in range(
-                        1
-                        if (is_computing_ref or is_computing_old_ahead)
-                        else self.mu_iterations
-                    ):
-                        local_mini_step = 0
-                        local_optimize_step = 0
-                        with torch.cuda.stream(self.train_stream):
-                            for i in range(0, batch_size, per_optimize_batch_size):
-                                end = min(i + per_optimize_batch_size, batch_size)
-                                # Convert advantages from [batch_size] -> [batch_size, max_len] via expanding
-                                processed_samples_for_optimize = processed_samples[i:end]
-                                if (
-                                    len(cached_minibatch_arrangements)
-                                    > local_optimize_step
-                                ):
-                                    (
-                                        mini_batches,
-                                        mini_batch_index,
-                                    ) = cached_minibatch_arrangements[
-                                        local_optimize_step
+                with torch.profiler.record_function(profiler_phase_name):
+                    with torch.set_grad_enabled(phase == TrainerPhase.TRAIN):
+                        for i_mu in range(
+                            1
+                            if (is_computing_ref or is_computing_old_ahead)
+                            else self.mu_iterations
+                        ):
+                            local_mini_step = 0
+                            local_optimize_step = 0
+                            with torch.cuda.stream(self.train_stream):
+                                for i in range(0, batch_size, per_optimize_batch_size):
+                                    end = min(i + per_optimize_batch_size, batch_size)
+                                    # Convert advantages from [batch_size] -> [batch_size, max_len] via expanding
+                                    processed_samples_for_optimize = processed_samples[
+                                        i:end
                                     ]
-                                else:
                                     if (
-                                        self.config.train.train_policy.max_token_len_per_mini_batch
-                                        is not None
-                                        and self.config.train.train_policy.max_token_len_per_mini_batch
-                                        > 0
+                                        len(cached_minibatch_arrangements)
+                                        > local_optimize_step
                                     ):
-                                        minibatch_seq_len = [
-                                            self.data_packer.policy_compute_max_len(
-                                                [sample]
-                                            )
-                                            for sample in processed_samples_for_optimize
+                                        (
+                                            mini_batches,
+                                            mini_batch_index,
+                                        ) = cached_minibatch_arrangements[
+                                            local_optimize_step
                                         ]
-                                        # split batch into mini_batches with sequence parallelism
-                                        if self.parallel_dims.cp_enabled:
-                                            cp_size = self.parallel_dims.mesh["cp"].size()
-                                        else:
-                                            cp_size = 1
-                                        max_token_len = (
-                                            self.config.train.train_policy.max_token_len_per_mini_batch
-                                            * cp_size
-                                        )
-                                        # dynamic rearrange mini batches
-                                        mini_batches, mini_batch_index = (
-                                            rearrange_mini_batches(
-                                                batch=processed_samples_for_optimize,
-                                                seq_len_effective=minibatch_seq_len,
-                                                max_token_len=max_token_len,
-                                                ddp_comm=inter_policy_nccl,
-                                            )
-                                        )
                                     else:
-                                        # split batch into mini_batches
-                                        mini_batches = [
-                                            processed_samples_for_optimize[
-                                                i : i + self.mini_batch
+                                        if (
+                                            self.config.train.train_policy.max_token_len_per_mini_batch
+                                            is not None
+                                            and self.config.train.train_policy.max_token_len_per_mini_batch
+                                            > 0
+                                        ):
+                                            minibatch_seq_len = [
+                                                self.data_packer.policy_compute_max_len(
+                                                    [sample]
+                                                )
+                                                for sample in processed_samples_for_optimize
                                             ]
-                                            for i in range(
-                                                0,
-                                                len(processed_samples_for_optimize),
-                                                self.mini_batch,
+                                            # split batch into mini_batches with sequence parallelism
+                                            if self.parallel_dims.cp_enabled:
+                                                cp_size = self.parallel_dims.mesh[
+                                                    "cp"
+                                                ].size()
+                                            else:
+                                                cp_size = 1
+                                            max_token_len = (
+                                                self.config.train.train_policy.max_token_len_per_mini_batch
+                                                * cp_size
                                             )
-                                        ]
-                                        mini_batch_index = [
-                                            list(
-                                                range(
-                                                    i,
-                                                    min(
-                                                        i + self.mini_batch,
-                                                        len(
-                                                            processed_samples_for_optimize
-                                                        ),
-                                                    ),
+                                            # dynamic rearrange mini batches
+                                            mini_batches, mini_batch_index = (
+                                                rearrange_mini_batches(
+                                                    batch=processed_samples_for_optimize,
+                                                    seq_len_effective=minibatch_seq_len,
+                                                    max_token_len=max_token_len,
+                                                    ddp_comm=inter_policy_nccl,
                                                 )
                                             )
-                                            for i in range(
-                                                0,
-                                                len(processed_samples_for_optimize),
-                                                self.mini_batch,
-                                            )
-                                        ]
-                                    cached_minibatch_arrangements.append(
-                                        (mini_batches, mini_batch_index)
-                                    )
+                                        else:
+                                            # split batch into mini_batches
+                                            mini_batches = [
+                                                processed_samples_for_optimize[
+                                                    i : i + self.mini_batch
+                                                ]
+                                                for i in range(
+                                                    0,
+                                                    len(processed_samples_for_optimize),
+                                                    self.mini_batch,
+                                                )
+                                            ]
+                                            mini_batch_index = [
+                                                list(
+                                                    range(
+                                                        i,
+                                                        min(
+                                                            i + self.mini_batch,
+                                                            len(
+                                                                processed_samples_for_optimize
+                                                            ),
+                                                        ),
+                                                    )
+                                                )
+                                                for i in range(
+                                                    0,
+                                                    len(processed_samples_for_optimize),
+                                                    self.mini_batch,
+                                                )
+                                            ]
+                                        cached_minibatch_arrangements.append(
+                                            (mini_batches, mini_batch_index)
+                                        )
                                 for (
                                     minibatched_processed_samples,
                                     mini_batch_indices,
@@ -1574,16 +1584,19 @@ class GRPOTrainer(LLMTrainer):
                                         )
                                 else:
                                     with self.act_offloading_ctx_manager:
-                                        with measure_time(
-                                            perf_metrics,
-                                            f"{phase_metric_prefix}self_model",
-                                            enabled=perf_enabled,
-                                            cuda_device=self.device,
+                                        with torch.profiler.record_function(
+                                            f"{profiler_phase_name}.self_model"
                                         ):
-                                            model_output = self.model(
-                                                **user_mini_batch
-                                            )
-                                            raw_logits = model_output.logits
+                                            with measure_time(
+                                                perf_metrics,
+                                                f"{phase_metric_prefix}self_model",
+                                                enabled=perf_enabled,
+                                                cuda_device=self.device,
+                                            ):
+                                                model_output = self.model(
+                                                    **user_mini_batch
+                                                )
+                                                raw_logits = model_output.logits
 
                                     if self.parallel_dims.cp_enabled:
                                         # reset the position ids and input ids
@@ -1626,23 +1639,26 @@ class GRPOTrainer(LLMTrainer):
                                         cu_seqlens,
                                         metrics,
                                     ) = (None, None, None)
-                                    with measure_time(
-                                        perf_metrics,
-                                        f"{phase_metric_prefix}compute_logprobs",
-                                        enabled=perf_enabled,
-                                        cuda_device=self.device,
+                                    with torch.profiler.record_function(
+                                        f"{profiler_phase_name}.compute_logprobs"
                                     ):
-                                        (
-                                            current_per_token_logprobs,
-                                            cu_seqlens,
-                                            metrics,
-                                        ) = self.compute_logprobs(
-                                            user_mini_batch,
-                                            logits=raw_logits,
-                                            is_full_logits=True
-                                            if raw_logits.ndim == 3
-                                            else False,
-                                        )
+                                        with measure_time(
+                                            perf_metrics,
+                                            f"{phase_metric_prefix}compute_logprobs",
+                                            enabled=perf_enabled,
+                                            cuda_device=self.device,
+                                        ):
+                                            (
+                                                current_per_token_logprobs,
+                                                cu_seqlens,
+                                                metrics,
+                                            ) = self.compute_logprobs(
+                                                user_mini_batch,
+                                                logits=raw_logits,
+                                                is_full_logits=True
+                                                if raw_logits.ndim == 3
+                                                else False,
+                                            )
                                     # Compute ref per-token logprobs if needed
                                     if is_computing_ref:
                                         assert i_mu == 0, (
@@ -1778,38 +1794,41 @@ class GRPOTrainer(LLMTrainer):
                                             if hasattr(self, "loss_fn")
                                             else compute_loss
                                         )
-                                        with measure_time(
-                                            perf_metrics,
-                                            f"{phase_metric_prefix}compute_loss_fn",
-                                            enabled=perf_enabled,
-                                            cuda_device=self.device,
+                                        with torch.profiler.record_function(
+                                            f"{profiler_phase_name}.compute_loss_fn"
                                         ):
-                                            (
-                                                loss,
-                                                per_token_loss,
-                                                kl_loss,
-                                            ) = compute_loss_fn(
-                                                current_per_token_logprobs,
-                                                self.old_per_token_logps[
-                                                    local_mini_step
-                                                ],
-                                                self.ref_per_token_logps[
-                                                    local_mini_step
-                                                ],
-                                                current_advantages,
-                                                cu_seqlens,
-                                                self.config,
-                                                logprob_masks,
-                                                dp_group=self.parallel_dims.mesh[
-                                                    "dp"
-                                                ].get_group()
-                                                if self.parallel_dims.dp_enabled
-                                                else None,
-                                                ddp_comm=inter_policy_nccl,
-                                                rollout_per_token_logps=user_mini_batch.get(
-                                                    "rollout_logprobs", None
-                                                ),
-                                            )
+                                            with measure_time(
+                                                perf_metrics,
+                                                f"{phase_metric_prefix}compute_loss_fn",
+                                                enabled=perf_enabled,
+                                                cuda_device=self.device,
+                                            ):
+                                                (
+                                                    loss,
+                                                    per_token_loss,
+                                                    kl_loss,
+                                                ) = compute_loss_fn(
+                                                    current_per_token_logprobs,
+                                                    self.old_per_token_logps[
+                                                        local_mini_step
+                                                    ],
+                                                    self.ref_per_token_logps[
+                                                        local_mini_step
+                                                    ],
+                                                    current_advantages,
+                                                    cu_seqlens,
+                                                    self.config,
+                                                    logprob_masks,
+                                                    dp_group=self.parallel_dims.mesh[
+                                                        "dp"
+                                                    ].get_group()
+                                                    if self.parallel_dims.dp_enabled
+                                                    else None,
+                                                    ddp_comm=inter_policy_nccl,
+                                                    rollout_per_token_logps=user_mini_batch.get(
+                                                        "rollout_logprobs", None
+                                                    ),
+                                                )
                                         if (
                                             self.config.train.train_policy.entropy_coeff
                                             > 0.0
@@ -1848,13 +1867,16 @@ class GRPOTrainer(LLMTrainer):
                                         )
                                         kl_loss = kl_loss * loss_scaling_factor
 
-                                        with measure_time(
-                                            perf_metrics,
-                                            f"{phase_metric_prefix}backward",
-                                            enabled=perf_enabled,
-                                            cuda_device=self.device,
+                                        with torch.profiler.record_function(
+                                            f"{profiler_phase_name}.backward"
                                         ):
-                                            loss.backward()
+                                            with measure_time(
+                                                perf_metrics,
+                                                f"{phase_metric_prefix}backward",
+                                                enabled=perf_enabled,
+                                                cuda_device=self.device,
+                                            ):
+                                                loss.backward()
                                         loss_sum += (
                                             per_token_loss.item() / loss_scaling_factor
                                         )
@@ -1873,9 +1895,12 @@ class GRPOTrainer(LLMTrainer):
                                     == 0
                                 ) and local_mini_step > 1:
                                     all_reduced = True
-                                    grad_norm_sum += self.all_reduce_states(
-                                        inter_policy_nccl
-                                    )
+                                    with torch.profiler.record_function(
+                                        f"{profiler_phase_name}.all_reduce_states"
+                                    ):
+                                        grad_norm_sum += self.all_reduce_states(
+                                            inter_policy_nccl
+                                        )
                                     grad_norm_count += 1
                                 else:
                                     all_reduced = False
@@ -1885,9 +1910,12 @@ class GRPOTrainer(LLMTrainer):
                                 and not is_computing_old_ahead
                                 and not all_reduced
                             ):
-                                grad_norm_sum += self.all_reduce_states(
-                                    inter_policy_nccl
-                                )
+                                with torch.profiler.record_function(
+                                    f"{profiler_phase_name}.all_reduce_states"
+                                ):
+                                    grad_norm_sum += self.all_reduce_states(
+                                        inter_policy_nccl
+                                    )
                                 grad_norm_count += 1
                             local_optimize_step += 1
         self.old_per_token_logps = []
@@ -2222,15 +2250,18 @@ class GRPOTrainer(LLMTrainer):
                 # which is not supported by DTensor operands like `torch.nn.utils.get_total_norm`
                 # So we need to do allreduce for each model part
                 if model_part is not None:
-                    with measure_time(
-                        perf_metrics,
-                        "all_reduce_comm",
-                        enabled=perf_enabled and perf_metrics is not None,
-                        cuda_device=self.device,
+                    with torch.profiler.record_function(
+                        "grpo.phase_train.all_reduce_comm"
                     ):
-                        dist_util.gradient_reduce_across_dp_replicas_(
-                            [p for p in model_part.parameters()], inter_policy_nccl
-                        )
+                        with measure_time(
+                            perf_metrics,
+                            "all_reduce_comm",
+                            enabled=perf_enabled and perf_metrics is not None,
+                            cuda_device=self.device,
+                        ):
+                            dist_util.gradient_reduce_across_dp_replicas_(
+                                [p for p in model_part.parameters()], inter_policy_nccl
+                            )
             """
             Compute the global grad norm on all parameters and then apply
             gradient clipping using the global grad norm.
@@ -2242,23 +2273,26 @@ class GRPOTrainer(LLMTrainer):
                 for m in [model for model in self.model_parts if model is not None]
                 for p in m.parameters()
             ]
-            with measure_time(
-                perf_metrics,
-                "optimizer_step",
-                enabled=perf_enabled and perf_metrics is not None,
-                cuda_device=self.device,
-            ):
-                grad_norm = dist_util.gradient_norm_clipping(
-                    all_params,
-                    self.config.train.optm_grad_norm_clip,
-                    foreach=True,
-                    pp_mesh=self.parallel_dims.mesh["pp"]
-                    if self.parallel_dims.pp_enabled
-                    else None,
-                    return_norm_only=(self.config.train.optm_grad_norm_clip <= 0.0),
-                )
-                self.optimizers.step()
-                self.optimizers.zero_grad()
+            with torch.profiler.record_function("grpo.phase_train.optimizer_step"):
+                with measure_time(
+                    perf_metrics,
+                    "optimizer_step",
+                    enabled=perf_enabled and perf_metrics is not None,
+                    cuda_device=self.device,
+                ):
+                    grad_norm = dist_util.gradient_norm_clipping(
+                        all_params,
+                        self.config.train.optm_grad_norm_clip,
+                        foreach=True,
+                        pp_mesh=self.parallel_dims.mesh["pp"]
+                        if self.parallel_dims.pp_enabled
+                        else None,
+                        return_norm_only=(
+                            self.config.train.optm_grad_norm_clip <= 0.0
+                        ),
+                    )
+                    self.optimizers.step()
+                    self.optimizers.zero_grad()
         return grad_norm
 
     @property
