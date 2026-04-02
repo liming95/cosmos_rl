@@ -1031,14 +1031,20 @@ class GRPOTrainer(LLMTrainer):
             "prepare_policy_inputs",
             enabled=perf_enabled,
         ):
-            processed_samples: List[Any] = [
-                self.data_packer.get_policy_input(
-                    samples[i],
-                    completions_list[i],
-                    n_ignore_prefix_tokens_list[i],
-                )
-                for i in range(len(samples))
-            ]
+            processed_samples: List[Any] = []
+            for i in range(len(samples)):
+                with measure_time(
+                    perf_metrics,
+                    f"prepare_policy_inputs/input_{i}",
+                    enabled=perf_enabled,
+                ):
+                    processed_samples.append(
+                        self.data_packer.get_policy_input(
+                            samples[i],
+                            completions_list[i],
+                            n_ignore_prefix_tokens_list[i],
+                        )
+                    )
 
         # On-policy Distillation related computations
         assert len(processed_samples) == len(rollouts) and len(samples) == len(
@@ -1104,6 +1110,7 @@ class GRPOTrainer(LLMTrainer):
         cached_minibatch_arrangements = []
         for phase in trainer_phases:
             phase_metric_key = f"phase_{phase.value}"
+            phase_metric_prefix = f"{phase_metric_key}/"
             is_computing_ref = phase == TrainerPhase.REF_COMPUTE
             is_computing_old_ahead = phase == TrainerPhase.OLD_LOGP_COMPUTE
             # Set model to eval mode if reference model is being used
@@ -1567,8 +1574,16 @@ class GRPOTrainer(LLMTrainer):
                                         )
                                 else:
                                     with self.act_offloading_ctx_manager:
-                                        model_output = self.model(**user_mini_batch)
-                                        raw_logits = model_output.logits
+                                        with measure_time(
+                                            perf_metrics,
+                                            f"{phase_metric_prefix}self_model",
+                                            enabled=perf_enabled,
+                                            cuda_device=self.device,
+                                        ):
+                                            model_output = self.model(
+                                                **user_mini_batch
+                                            )
+                                            raw_logits = model_output.logits
 
                                     if self.parallel_dims.cp_enabled:
                                         # reset the position ids and input ids
@@ -1610,13 +1625,24 @@ class GRPOTrainer(LLMTrainer):
                                         current_per_token_logprobs,
                                         cu_seqlens,
                                         metrics,
-                                    ) = self.compute_logprobs(
-                                        user_mini_batch,
-                                        logits=raw_logits,
-                                        is_full_logits=True
-                                        if raw_logits.ndim == 3
-                                        else False,
-                                    )
+                                    ) = (None, None, None)
+                                    with measure_time(
+                                        perf_metrics,
+                                        f"{phase_metric_prefix}compute_logprobs",
+                                        enabled=perf_enabled,
+                                        cuda_device=self.device,
+                                    ):
+                                        (
+                                            current_per_token_logprobs,
+                                            cu_seqlens,
+                                            metrics,
+                                        ) = self.compute_logprobs(
+                                            user_mini_batch,
+                                            logits=raw_logits,
+                                            is_full_logits=True
+                                            if raw_logits.ndim == 3
+                                            else False,
+                                        )
                                     # Compute ref per-token logprobs if needed
                                     if is_computing_ref:
                                         assert i_mu == 0, (
@@ -1752,24 +1778,38 @@ class GRPOTrainer(LLMTrainer):
                                             if hasattr(self, "loss_fn")
                                             else compute_loss
                                         )
-                                        loss, per_token_loss, kl_loss = compute_loss_fn(
-                                            current_per_token_logprobs,
-                                            self.old_per_token_logps[local_mini_step],
-                                            self.ref_per_token_logps[local_mini_step],
-                                            current_advantages,
-                                            cu_seqlens,
-                                            self.config,
-                                            logprob_masks,
-                                            dp_group=self.parallel_dims.mesh[
-                                                "dp"
-                                            ].get_group()
-                                            if self.parallel_dims.dp_enabled
-                                            else None,
-                                            ddp_comm=inter_policy_nccl,
-                                            rollout_per_token_logps=user_mini_batch.get(
-                                                "rollout_logprobs", None
-                                            ),
-                                        )
+                                        with measure_time(
+                                            perf_metrics,
+                                            f"{phase_metric_prefix}compute_loss_fn",
+                                            enabled=perf_enabled,
+                                            cuda_device=self.device,
+                                        ):
+                                            (
+                                                loss,
+                                                per_token_loss,
+                                                kl_loss,
+                                            ) = compute_loss_fn(
+                                                current_per_token_logprobs,
+                                                self.old_per_token_logps[
+                                                    local_mini_step
+                                                ],
+                                                self.ref_per_token_logps[
+                                                    local_mini_step
+                                                ],
+                                                current_advantages,
+                                                cu_seqlens,
+                                                self.config,
+                                                logprob_masks,
+                                                dp_group=self.parallel_dims.mesh[
+                                                    "dp"
+                                                ].get_group()
+                                                if self.parallel_dims.dp_enabled
+                                                else None,
+                                                ddp_comm=inter_policy_nccl,
+                                                rollout_per_token_logps=user_mini_batch.get(
+                                                    "rollout_logprobs", None
+                                                ),
+                                            )
                                         if (
                                             self.config.train.train_policy.entropy_coeff
                                             > 0.0
@@ -1808,7 +1848,13 @@ class GRPOTrainer(LLMTrainer):
                                         )
                                         kl_loss = kl_loss * loss_scaling_factor
 
-                                        loss.backward()
+                                        with measure_time(
+                                            perf_metrics,
+                                            f"{phase_metric_prefix}backward",
+                                            enabled=perf_enabled,
+                                            cuda_device=self.device,
+                                        ):
+                                            loss.backward()
                                         loss_sum += (
                                             per_token_loss.item() / loss_scaling_factor
                                         )

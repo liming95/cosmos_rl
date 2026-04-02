@@ -118,6 +118,55 @@ def summarize_perf_metrics(
     return summary
 
 
+def summarize_perf_metrics_by_prefix(
+    total_metrics: Dict[str, float] | DefaultDict[str, float],
+    *,
+    prefix: str,
+    count: int,
+    metric_counts: Dict[str, int] | DefaultDict[str, int] | None = None,
+) -> Dict[str, float]:
+    filtered_metrics: Dict[str, float] = {
+        key: float(value)
+        for key, value in total_metrics.items()
+        if key.startswith(prefix)
+    }
+    filtered_counts: Dict[str, int] | None = None
+    if metric_counts is not None:
+        filtered_counts = {
+            key: int(value)
+            for key, value in metric_counts.items()
+            if key.startswith(prefix)
+        }
+    return summarize_perf_metrics(
+        filtered_metrics,
+        count=count,
+        metric_counts=filtered_counts,
+    )
+
+
+def summarize_perf_metrics_by_keys(
+    total_metrics: Dict[str, float] | DefaultDict[str, float],
+    *,
+    keys: Iterable[str],
+    count: int,
+    metric_counts: Dict[str, int] | DefaultDict[str, int] | None = None,
+) -> Dict[str, float]:
+    key_list = list(keys)
+    filtered_metrics: Dict[str, float] = {
+        key: float(total_metrics[key]) for key in key_list if key in total_metrics
+    }
+    filtered_counts: Dict[str, int] | None = None
+    if metric_counts is not None:
+        filtered_counts = {
+            key: int(metric_counts[key]) for key in key_list if key in metric_counts
+        }
+    return summarize_perf_metrics(
+        filtered_metrics,
+        count=count,
+        metric_counts=filtered_counts,
+    )
+
+
 def write_perf_summary(
     output_dir: str,
     *,

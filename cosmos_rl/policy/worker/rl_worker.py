@@ -69,6 +69,8 @@ from cosmos_rl.utils.perf_utils import (
     new_perf_metrics,
     stage_perf_enabled,
     summarize_perf_metrics,
+    summarize_perf_metrics_by_keys,
+    summarize_perf_metrics_by_prefix,
     write_perf_summary,
 )
 
@@ -277,17 +279,62 @@ class RLPolicyWorker(PolicyWorkerBase):
             return
         self._perf_summary_emitted = True
 
+        worker_count = sum(self.perf_counts.values())
+
         payload: Dict[str, object] = {
             "role": "policy",
             "replica_name": self.replica_name,
             "global_rank": self.global_rank,
             "policy_worker": summarize_perf_metrics(
                 self.perf_totals,
-                count=sum(self.perf_counts.values()),
+                count=worker_count,
                 metric_counts=self.perf_metric_counts,
             ),
             "policy_counts": dict(self.perf_counts),
             "policy_metric_counts": dict(self.perf_metric_counts),
+            "metric_relations": {
+                "policy_worker": {
+                    "policy_train_total": [
+                        "dispatch_rollouts",
+                        "trainer_step_total",
+                        "train_ack_post",
+                    ],
+                    "p2r_total": [
+                        "p2r_fetch_instructions",
+                        "p2r_precollect",
+                        "p2r_prepare_tensor",
+                        "p2r_send_comm",
+                    ],
+                    "p2r_send_comm": "prefix:p2r_send_comm/policy_rank_",
+                },
+                "trainer": {
+                    "prepare_policy_inputs": "prefix:prepare_policy_inputs/input_",
+                    "phase_ref_compute": [
+                        "phase_ref_compute/self_model",
+                        "phase_ref_compute/compute_logprobs",
+                    ],
+                    "phase_old_logp_compute": [
+                        "phase_old_logp_compute/self_model",
+                        "phase_old_logp_compute/compute_logprobs",
+                    ],
+                    "phase_train": [
+                        "phase_train/self_model",
+                        "phase_train/compute_logprobs",
+                        "phase_train/compute_loss_fn",
+                        "phase_train/backward",
+                        "all_reduce_comm",
+                        "optimizer_step",
+                    ],
+                },
+            },
+            "policy_worker_groups": {
+                "p2r_rank_sync": summarize_perf_metrics_by_prefix(
+                    self.perf_totals,
+                    prefix="p2r_send_comm/policy_rank_",
+                    count=worker_count,
+                    metric_counts=self.perf_metric_counts,
+                ),
+            },
         }
 
         trainer_totals = getattr(self.trainer, "_perf_train_totals", None)
@@ -302,6 +349,53 @@ class RLPolicyWorker(PolicyWorkerBase):
             payload["trainer_metric_counts"] = dict(
                 getattr(self.trainer, "_perf_train_metric_counts", {})
             )
+            payload["trainer_groups"] = {
+                "prepare_policy_inputs_per_input": summarize_perf_metrics_by_prefix(
+                    trainer_totals,
+                    prefix="prepare_policy_inputs/input_",
+                    count=trainer_count,
+                    metric_counts=getattr(
+                        self.trainer, "_perf_train_metric_counts", None
+                    ),
+                ),
+                "phase_ref_compute_breakdown": summarize_perf_metrics_by_keys(
+                    trainer_totals,
+                    keys=[
+                        "phase_ref_compute/self_model",
+                        "phase_ref_compute/compute_logprobs",
+                    ],
+                    count=trainer_count,
+                    metric_counts=getattr(
+                        self.trainer, "_perf_train_metric_counts", None
+                    ),
+                ),
+                "phase_old_logp_compute_breakdown": summarize_perf_metrics_by_keys(
+                    trainer_totals,
+                    keys=[
+                        "phase_old_logp_compute/self_model",
+                        "phase_old_logp_compute/compute_logprobs",
+                    ],
+                    count=trainer_count,
+                    metric_counts=getattr(
+                        self.trainer, "_perf_train_metric_counts", None
+                    ),
+                ),
+                "phase_train_breakdown": summarize_perf_metrics_by_keys(
+                    trainer_totals,
+                    keys=[
+                        "phase_train/self_model",
+                        "phase_train/compute_logprobs",
+                        "phase_train/compute_loss_fn",
+                        "phase_train/backward",
+                        "all_reduce_comm",
+                        "optimizer_step",
+                    ],
+                    count=trainer_count,
+                    metric_counts=getattr(
+                        self.trainer, "_perf_train_metric_counts", None
+                    ),
+                ),
+            }
 
         summary_path = write_perf_summary(
             self.config.train.output_dir,
@@ -533,9 +627,15 @@ class RLPolicyWorker(PolicyWorkerBase):
                                 logger.debug(
                                     f"[Policy] Sending tensor {dest_name} from policy rank {self.global_rank} to rollout rank {r_rank}, shape {view.shape} with dtype: {view.dtype}."
                                 )
-                                self.p2r_collective_manager.send(
-                                    base_mesh_key, view, r_rank
-                                )
+                                with measure_time(
+                                    perf_metrics,
+                                    f"p2r_send_comm/policy_rank_{self.global_rank}_to_rollout_rank_{r_rank}",
+                                    enabled=perf_enabled,
+                                    cuda_device=self.device,
+                                ):
+                                    self.p2r_collective_manager.send(
+                                        base_mesh_key, view, r_rank
+                                    )
                         if (
                             self.rl_mode != "colocated_separated"
                             and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
