@@ -102,9 +102,9 @@ def summarize_perf_metrics(
     *,
     count: int,
     metric_counts: Dict[str, int] | DefaultDict[str, int] | None = None,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     count = max(int(count), 1)
-    summary: Dict[str, float] = {"count": float(count)}
+    summary: Dict[str, object] = {"count": float(count), "metrics": {}}
     for key, value in total_metrics.items():
         value = float(value)
         per_metric_count = (
@@ -112,9 +112,11 @@ def summarize_perf_metrics(
             if metric_counts is not None
             else count
         )
-        summary[f"metric_count/{key}"] = float(per_metric_count)
-        summary[f"total/{key}"] = value
-        summary[f"avg/{key}"] = value / per_metric_count
+        summary["metrics"][key] = {
+            "count": float(per_metric_count),
+            "total": value,
+            "avg": value / per_metric_count,
+        }
     return summary
 
 
@@ -179,7 +181,7 @@ def write_perf_summary(
     summary_dir.mkdir(parents=True, exist_ok=True)
     path = summary_dir / f"{category}_{replica_name}_{global_rank}.json"
     with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
+        json.dump(payload, f, indent=2, sort_keys=False, ensure_ascii=False)
     return str(path)
 
 
@@ -188,7 +190,19 @@ def append_perf_summary(output_dir: str, payload: Dict) -> str:
     summary_dir.mkdir(parents=True, exist_ok=True)
     path = summary_dir / "all_summaries.jsonl"
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, sort_keys=True) + "\n")
+        f.write(json.dumps(payload, sort_keys=False, ensure_ascii=False) + "\n")
+
+    pretty_path = summary_dir / "all_summaries.json"
+    records = []
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+    with pretty_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, sort_keys=False, ensure_ascii=False)
     return str(path)
 
 
