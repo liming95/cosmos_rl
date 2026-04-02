@@ -91,6 +91,7 @@ class Alpamayo1_5(ReasoningVLA):
         pretrained_modules: dict[str, torch.nn.Module] | None = None,
         original_vocab_size: int | None = None,
     ):
+        print(f"pretrained_modules: {pretrained_modules}")
         super().__init__(config, pretrained_modules, original_vocab_size, print_param_count=False)
 
         # we only need the text config for the expert model

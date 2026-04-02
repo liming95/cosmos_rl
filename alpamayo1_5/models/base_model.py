@@ -317,6 +317,7 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
 
         # Build tokenizer
         self.tokenizer = self._build_tokenizer(config)
+        self.vlm_tokenizer = self._build_vlm_tokenizer(config)
         self.special_token_ids = {
             k: self.tokenizer.convert_tokens_to_ids(v) for k, v in SPECIAL_TOKENS.items()
         }
@@ -327,6 +328,17 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
             trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
             logger.info(f"Total parameters: {total_params:,}")
             logger.info(f"Trainable parameters: {trainable_params:,}")
+    
+    def _build_vlm_tokenizer(self, config: ReasoningVLAConfig) -> Any:
+        processor_kwargs = {}
+        if config.min_pixels is not None:
+            processor_kwargs["min_pixels"] = config.min_pixels
+        if config.max_pixels is not None:
+            processor_kwargs["max_pixels"] = config.max_pixels
+
+        processor = AutoProcessor.from_pretrained(config.vlm_name_or_path, **processor_kwargs)
+        tokenizer = processor.tokenizer
+        return tokenizer
 
     def _build_tokenizer(self, config: ReasoningVLAConfig) -> Any:
         """Build tokenizer with trajectory tokens."""
@@ -338,6 +350,8 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
 
         processor = AutoProcessor.from_pretrained(config.vlm_name_or_path, **processor_kwargs)
         tokenizer = processor.tokenizer
+        self.vlm_tokenizer = tokenizer
+        # print(f"vlm tokenizer: {self.vlm_tokenizer}")
 
         if config.traj_vocab_size is not None:
             discrete_tokens = [f"<i{v}>" for v in range(config.traj_vocab_size)]

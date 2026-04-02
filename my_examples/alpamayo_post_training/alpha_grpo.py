@@ -18,15 +18,17 @@ from cosmos_rl.launcher.worker_entry import main as launch_worker
 from cosmos_rl.policy.config import Config
 from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.utils.logging import logger
-from my_examples.alpamayo1_5 import helper
-from my_examples.alpamayo1_5.load_physical_aiavdataset import (
+from alpamayo1_5 import helper
+from alpamayo1_5.load_physical_aiavdataset import (
     load_physical_aiavdataset,
 )
-from my_examples.alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
-from my_examples.alpamayo1_5.models.base_model import (
+from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
+from alpamayo1_5.models.base_model import (
     TRAJ_TOKEN,
     tokenize_history_trajectory,
 )
+
+from transformers import AutoProcessor, AutoTokenizer
 
 ALPAMAYO_SOURCE_MODEL_ENV = "ALPAMAYO_SOURCE_MODEL_PATH"
 CONFIG_BASE_DIR: Path | None = None
@@ -69,12 +71,61 @@ def _resolve_dataset_records(dataset_cfg) -> list[dict[str, Any]]:
     return _load_manifest(str(dataset_path))
 
 
+# def _export_vlm_if_needed(
+#     source_model_path: str,
+#     export_dir: Path,
+# ) -> None:
+#     config_file = export_dir / "config.json"
+#     tokenizer_file = export_dir / "tokenizer_config.json"
+#     if config_file.exists() and tokenizer_file.exists():
+#         logger.info(f"[AlphaGRPO] Reusing exported VLM at {export_dir}")
+#         return
+
+#     export_dir.mkdir(parents=True, exist_ok=True)
+#     logger.info(f"[AlphaGRPO] Exporting VLM submodule from {source_model_path} to {export_dir}")
+
+#     model = Alpamayo1_5.from_pretrained(source_model_path, dtype=torch.bfloat16)
+#     vlm = model.vlm
+
+#     import math
+#     old_vocab_size = vlm.config.vocab_size
+#     new_vocab_size = math.ceil(old_vocab_size / 8) * 8
+
+#     if new_vocab_size != old_vocab_size:
+#         logger.info(f"[AlphaGRPO] Resize vocab: {old_vocab_size} -> {new_vocab_size}")
+#         vlm.resize_token_embeddings(new_vocab_size)
+#         vlm.config.vocab_size = new_vocab_size
+
+#     vlm.save_pretrained(export_dir)
+
+#     # tokenizer = AutoTokenizer.from_pretrained(
+#     #     source_model_path,
+#     #     fix_mistral_regex=True
+#     # )
+#     # tokenizer = AutoTokenizer.from_pretrained(
+#     #     export_dir,
+#     #     fix_mistral_regex=True
+#     # )
+#     tokenizer = model.tokenizer
+#     if new_vocab_size != old_vocab_size:
+#         logger.info("tokenizer")
+#         tokenizer.model_max_length = new_vocab_size
+#     # model.tokenizer.save_pretrained(export_dir)
+#     tokenizer.save_pretrained(export_dir)
+#     processor = helper.get_processor(tokenizer)
+#     processor.save_pretrained(export_dir)
+#     del model
+
 def _export_vlm_if_needed(
     source_model_path: str,
     export_dir: Path,
 ) -> None:
+    import math
+    from transformers import AutoTokenizer
+
     config_file = export_dir / "config.json"
     tokenizer_file = export_dir / "tokenizer_config.json"
+
     if config_file.exists() and tokenizer_file.exists():
         logger.info(f"[AlphaGRPO] Reusing exported VLM at {export_dir}")
         return
@@ -82,12 +133,61 @@ def _export_vlm_if_needed(
     export_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"[AlphaGRPO] Exporting VLM submodule from {source_model_path} to {export_dir}")
 
+    # 1. 加载模型
     model = Alpamayo1_5.from_pretrained(source_model_path, dtype=torch.bfloat16)
-    model.vlm.save_pretrained(export_dir)
-    model.tokenizer.save_pretrained(export_dir)
-    processor = helper.get_processor(model.tokenizer)
+    vlm = model.vlm
+
+    # tokenizer = model.tokenizer
+    # # vlm.config.vocab_size = 152064
+    # logger.info(f"[my test] vocab_size : {len(tokenizer)}")
+
+
+    # 2. 调整 vocab_size 为 8 的倍数
+    old_vocab_size = len(tokenizer) #vlm.config.vocab_size
+    new_vocab_size = math.ceil(old_vocab_size / 8) * 8
+
+    if new_vocab_size != old_vocab_size:
+        logger.info(f"[AlphaGRPO] Resize vocab: {old_vocab_size} -> {new_vocab_size}")
+        # token embeddings and lm_head
+        # vlm.resize_token_embeddings(new_vocab_size)
+        vlm.config.vocab_size = new_vocab_size
+
+        # sync tokenizer
+        tokenizer = model.tokenizer
+        logger.info(f"old tokenizer size: {tokenizer.model_max_length}, {len(tokenizer)}")
+        # tokenizer.model_max_length = new_vocab_size
+        # if hasattr(tokenizer, "vocab_size"):
+        #     tokenizer.vocab_size = new_vocab_size
+        # additional_tokens = new_vocab_size -len(tokenizer)
+        # logger.info(f"addtional tokens: {new_vocab_size} - {len(tokenizer)} = {additional_tokens}")
+        # if additional_tokens > 0:
+        #     additional_tokens_list = [f"<extra_id_{i}>" for i in range(additional_tokens)]
+        #     tokenizer.add_special_tokens({"additional_special_tokens": additional_tokens_list})
+            # tokenizer.add_special_tokens({"additional_special_tokens": ["<pad>"] * additional_tokens})
+        logger.info(f"old tokenizer size: {tokenizer.model_max_length}, {len(tokenizer)}")
+    else:
+        tokenizer = model.tokenizer
+
+    # 3.
+    vlm.save_pretrained(export_dir)
+
+    # 4.
+    tokenizer.save_pretrained(export_dir)
+    processor = helper.get_processor(tokenizer)
     processor.save_pretrained(export_dir)
+
+    # 5. check
+    # lm_weight_shape = vlm.lm_head.weight.shape
+    # if lm_weight_shape[0] != len(tokenizer):
+    #     raise RuntimeError(
+    #         f"[AlphaGRPO] lm_head.weight shape {lm_weight_shape} "
+    #         f"does not match tokenizer vocab_size {tokenizer.vocab_size}!"
+    #     )
+    # else:
+    #     logger.info(f"[AlphaGRPO] Check passed: lm_head.weight {lm_weight_shape} matches vocab_size {tokenizer.vocab_size}")
+
     del model
+    logger.info(f"[AlphaGRPO] Export completed at {export_dir}")
 
 
 class AlphaDataset(Dataset):
@@ -341,29 +441,32 @@ def get_dataset(config: CosmosConfig) -> Dataset:
 def get_val_dataset(config: CosmosConfig) -> Dataset:
     return AlphaValDataset() if config.validation.enable else None
 
-
+from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker, worker_entry_parser
+from cosmos_rl.utils.logging import logger
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    args = parser.parse_known_args()[0]
-    config_path = Path(args.config).resolve()
-    CONFIG_BASE_DIR = config_path.parent
-    with open(config_path, encoding="utf-8") as f:
-        config_dict = toml.load(f)
-    config = Config.from_dict(config_dict)
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--config", type=str, required=True)
+    # parser = worker_entry_parser()
+    # args = parser.parse_args()
+    # config_path = Path(args.config).resolve()
+    # CONFIG_BASE_DIR = config_path.parent
+    # with open(config_path, encoding="utf-8") as f:
+    #     config_dict = toml.load(f)
+    # config = Config.from_dict(config_dict)
 
-    source_model_path = os.environ.get(
-        ALPAMAYO_SOURCE_MODEL_ENV,
-        config.policy.model_name_or_path,
-    )
-    os.environ[ALPAMAYO_SOURCE_MODEL_ENV] = source_model_path
-    export_dir = (CONFIG_BASE_DIR.parent / "exported_vlm").resolve()
-    _export_vlm_if_needed(source_model_path, export_dir)
-    config_dict["policy"]["model_name_or_path"] = str(export_dir)
-    runtime_config_path = CONFIG_BASE_DIR / "_runtime_rl.toml"
-    with open(runtime_config_path, "w", encoding="utf-8") as f:
-        toml.dump(config_dict, f)
-    args.config = str(runtime_config_path)
+    # source_model_path = os.environ.get(
+    #     ALPAMAYO_SOURCE_MODEL_ENV,
+    #     config.policy.model_name_or_path,
+    # )
+    # os.environ[ALPAMAYO_SOURCE_MODEL_ENV] = source_model_path
+    # export_dir = (CONFIG_BASE_DIR.parent / "exported_vlm").resolve()
+    # _export_vlm_if_needed(source_model_path, export_dir)
+    # config_dict["policy"]["model_name_or_path"] = str(export_dir)
+    # runtime_config_path = CONFIG_BASE_DIR / "_runtime_rl.toml"
+    # with open(runtime_config_path, "w", encoding="utf-8") as f:
+    #     toml.dump(config_dict, f)
+    # args.config = str(runtime_config_path)
+    # logger.info(f"[my_test] runtime_config_path: {runtime_config_path}, new model:{export_dir}")
 
     def dataset_factory(config: CosmosConfig) -> Dataset:
         return get_dataset(config)
@@ -378,5 +481,5 @@ if __name__ == "__main__":
         val_dataset=val_dataset_factory,
         val_reward_fns=[fake_reward_fn],
         val_data_packer=AlphaDataPacker(),
-        args=args,
+        # args=args,
     )

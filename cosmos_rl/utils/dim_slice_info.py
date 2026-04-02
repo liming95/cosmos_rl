@@ -17,6 +17,7 @@ from typing import Dict, Any, Union, List, Tuple
 from functools import reduce
 from math import gcd
 import torch
+from cosmos_rl.utils.logging import logger
 
 try:
     from torch.distributed.tensor.placement_types import (
@@ -86,6 +87,7 @@ def slice_tensor_with_strategy(
     """
 
     view = tensor
+    logger.info(f"[my test] shape: {view.shape}, idx: {idx}, total_size: {tensor_split_strategy.total_size}, offset: {tensor_split_strategy.offset}")
     assert view.shape[idx] % tensor_split_strategy.total_size == 0, (
         f"Tensor shape {view.shape} on dim {idx} must be divisible by {tensor_split_strategy.total_size}"
     )
@@ -99,6 +101,8 @@ def slice_tensor_with_strategy(
         // tensor_split_strategy.total_size
         * tensor_split_strategy.length
     )
+    # start = tensor_split_strategy.offset
+    # length = tensor_split_strategy.length
     dim = view.dim()
     assert idx < view.dim(), f"Invalid index {idx} for {dim}D tensor."
     slices = (
@@ -129,6 +133,8 @@ def slice_tensor_with_strategies(
 
 torch.Tensor.cosmos_slice = slice_tensor_with_strategies
 
+def lcm(a: int, b: int) -> int:
+    return a * b // gcd(a, b)
 
 def get_unified_rank_info(
     a: DimSliceInfo, b: DimSliceInfo
@@ -140,6 +146,8 @@ def get_unified_rank_info(
     :return: A tuple containing the unified slice information for both objects.
     """
     size = max(a.total_size, b.total_size)
+    # size = lcm(a.total_size, b.total_size)
+    logger.info(f"[my test] slice info:{a}, {b}, size: {size}")
     assert size % a.total_size == 0 and size % b.total_size == 0, (
         "Sizes are not compatible for unification"
     )

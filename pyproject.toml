@@ -73,7 +73,7 @@ cosmos_rl = [
 flash-attn = ["torch"]
 
 [tool.setuptools.packages.find]
-include = ["cosmos_rl*"]
+include = ["cosmos_rl*", "alpamayo1_5"]
 
 [project.optional-dependencies]
 wfm = [

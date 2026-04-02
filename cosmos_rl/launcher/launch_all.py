@@ -842,6 +842,7 @@ cosmos-rl --config config.toml"""
         processes.append(controller_process[0])
 
     logger.info(f"Waiting for controller to be ready at {control_url}")
+    logger.info(f"[my test] control url: {control_url}")
     wait_for_url_ready(
         control_url, controller_process[0] if controller_cmd is not None else None
     )

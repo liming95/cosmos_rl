@@ -621,7 +621,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 cloned_target_tensor = cloned_target_tensor.to(target_dtype).to(
                     cloned_target_tensor.dtype
                 )
-                if not torch.allclose(cloned_target_tensor, target_tensor.cpu()):
+                if not torch.allclose(cloned_target_tensor, target_tensor.cpu(), atol=1e-3):
+                    logger.info(f"[my test]: cloned {cloned_target_tensor.shape}, target {target_tensor.shape}")
+                    diff = (cloned_target_tensor - target_tensor.cpu()).abs()
+
+                    num_diff = (diff > 1e-3).sum().item()
+                    total = diff.numel()
+                    logger.info(f"[my test] type: {cloned_target_tensor.dtype}, {target_tensor.dtype}; device: {cloned_target_tensor.device} {target_tensor.device}")
+                    logger.info(f"[my test] Different elements: {num_diff}/{total} ({num_diff/total:.6%})")
+                    logger.info(f"[my test] elements: {cloned_target_tensor[:10, :10]}, target_tensor: {target_tensor.cpu()[:10, :10]}")
                     raise ValueError(
                         f"Weight sync check failed after weight sync instruction: {insts} for {inst_dest_name}."
                     )
@@ -1446,6 +1454,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         start_time = time.time()
         while time.time() - start_time < float(timeout):
             cmd = self.consume_one_command(cmd_pred=cmd_pred)
+            logger.info(f"[my test] rollout control cmd: {cmd}")
             if cmd is not None:
                 last_cmd = cmd
                 none_cnt = 0

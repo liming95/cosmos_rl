@@ -1,0 +1,1 @@
+cosmos-rl --config ./configs/rl.toml --log-dir logs --debug ./alpha_grpo.py

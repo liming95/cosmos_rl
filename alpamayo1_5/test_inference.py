@@ -38,6 +38,9 @@ def main() -> None:
 
     model = Alpamayo1_5.from_pretrained("nvidia/Alpamayo-1.5-10B", dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
+    # print(model.__class__.__module__)
+    # print(dir(model))
+    # print(len(model.vlm_tokenizer))
 
     inputs = processor.apply_chat_template(
         messages,
