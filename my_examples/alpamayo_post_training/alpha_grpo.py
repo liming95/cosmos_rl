@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from cosmos_rl.policy.model.wfm import tokenizer
 import torch
 import toml
 from torch.utils.data import Dataset
@@ -207,16 +208,53 @@ class AlphaDataset(Dataset):
 
     def setup(self, config: CosmosConfig, *args, **kwargs):
         self.config = config
-        self.dataset = _resolve_dataset_records(config.train.train_policy.dataset)
-        logger.info(f"[AlphaDataset] Loaded {len(self.dataset)} training records")
+        dataset_config_list = _resolve_dataset_records(config.train.train_policy.dataset)
+        logger.info(f"[AlphaDataset] Loaded {len(dataset_config_list)} training records")
+
+        data_list = []
+        for idx, record in enumerate(dataset_config_list):
+            if "clip_id" not in record:
+                raise KeyError(f"Dataset record at idx={idx} is missing required `clip_id` field")
+            data = load_physical_aiavdataset(
+                clip_id=record["clip_id"], t0_us=record.get("t0_us", 5_100_000), num_history_steps=16, num_future_steps=64, time_step=0.1, num_frames=4
+            )
+            data_list.append(data)
+        self.dataset = data_list
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        payload = dict(self.dataset[idx])
-        if "clip_id" not in payload:
-            raise KeyError(f"Dataset record at idx={idx} does not contain `clip_id`")
+        payload = self.dataset[idx]
+        
+        image_frames = payload.get("image_frames")
+        camera_indices = payload.get("camera_indices")
+        ego_history_xyz = payload.get("ego_history_xyz")
+        ego_history_rot = payload.get("ego_history_rot")
+        
+        # tokenizer
+        model_name_or_path = os.environ.get(ALPAMAYO_SOURCE_MODEL_ENV, self.config.policy.model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            fix_mistral_regex=True,
+        )
+
+        # images context
+        # traj context for ego
+        # nav context
+        # prompt context
+        messages = helper.create_message_with_ego(
+            frames=image_frames.flatten(0, 1),
+            camera_indices=camera_indices,
+            ego_history_xyz=ego_history_xyz,
+            ego_history_rot=ego_history_rot,
+            tokenizer=tokenizer
+        )
+
+        
+        # build chat input fields for reward functions that may need them
+        # question = payload.get("question")
+        
         return payload
 
     def get_reference_answer(self, idx: int) -> Any:
@@ -252,173 +290,210 @@ class AlphaDataPacker(DataPacker):
     def setup(self, config: Config, *args, **kwargs):
         super().setup(config, *args, **kwargs)
         self.underlying_data_packer.setup(config, *args, **kwargs)
-        source_model_path = os.environ.get(
-            ALPAMAYO_SOURCE_MODEL_ENV,
-            config.policy.model_name_or_path,
-        )
-        self.alpamayo_hf_config = AutoConfig.from_pretrained(
-            source_model_path,
-            trust_remote_code=True,
-        )
-        self.hist_token_start_idx = self.alpamayo_hf_config.traj_token_start_idx
-        self.hist_traj_tokenizer = None
-        if getattr(self.alpamayo_hf_config, "hist_traj_tokenizer_cfg", None) is not None:
-            self.hist_traj_tokenizer = hyu.instantiate(
-                self.alpamayo_hf_config.hist_traj_tokenizer_cfg
-            )
-            if getattr(self.alpamayo_hf_config, "traj_tokenizer_cfg", None) is not None:
-                self.hist_token_start_idx += self.alpamayo_hf_config.traj_vocab_size
-        elif getattr(self.alpamayo_hf_config, "traj_tokenizer_cfg", None) is not None:
-            self.hist_traj_tokenizer = hyu.instantiate(
-                self.alpamayo_hf_config.traj_tokenizer_cfg,
-                load_weights=False,
-            )
+        # source_model_path = os.environ.get(
+        #     ALPAMAYO_SOURCE_MODEL_ENV,
+        #     config.policy.model_name_or_path,
+        # )
+        # self.alpamayo_hf_config = AutoConfig.from_pretrained(
+        #     source_model_path,
+        #     trust_remote_code=True,
+        # )
+        # self.hist_token_start_idx = self.alpamayo_hf_config.traj_token_start_idx
+        # self.hist_traj_tokenizer = None
+        # if getattr(self.alpamayo_hf_config, "hist_traj_tokenizer_cfg", None) is not None:
+        #     self.hist_traj_tokenizer = hyu.instantiate(
+        #         self.alpamayo_hf_config.hist_traj_tokenizer_cfg
+        #     )
+        #     if getattr(self.alpamayo_hf_config, "traj_tokenizer_cfg", None) is not None:
+        #         self.hist_token_start_idx += self.alpamayo_hf_config.traj_vocab_size
+        # elif getattr(self.alpamayo_hf_config, "traj_tokenizer_cfg", None) is not None:
+        #     self.hist_traj_tokenizer = hyu.instantiate(
+        #         self.alpamayo_hf_config.traj_tokenizer_cfg,
+        #         load_weights=False,
+        #     )
 
-    def _build_messages(self, item: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        clip_id = item["clip_id"]
-        t0_us = int(item.get("t0_us", 5_100_000))
-        num_history_steps = int(item.get("num_history_steps", 16))
-        num_future_steps = int(item.get("num_future_steps", 64))
-        time_step = float(item.get("time_step", 0.1))
-        num_frames = int(item.get("num_frames", 4))
+    # def _build_messages(self, item: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    #     clip_id = item["clip_id"]
+    #     t0_us = int(item.get("t0_us", 5_100_000))
+    #     num_history_steps = int(item.get("num_history_steps", 16))
+    #     num_future_steps = int(item.get("num_future_steps", 64))
+    #     time_step = float(item.get("time_step", 0.1))
+    #     num_frames = int(item.get("num_frames", 4))
 
-        data = load_physical_aiavdataset(
-            clip_id=clip_id,
-            t0_us=t0_us,
-            num_history_steps=num_history_steps,
-            num_future_steps=num_future_steps,
-            time_step=time_step,
-            num_frames=num_frames,
-        )
+    #     data = load_physical_aiavdataset(
+    #         clip_id=clip_id,
+    #         t0_us=t0_us,
+    #         num_history_steps=num_history_steps,
+    #         num_future_steps=num_future_steps,
+    #         time_step=time_step,
+    #         num_frames=num_frames,
+    #     )
 
-        question = item.get("question")
-        if question:
-            messages = helper.create_vqa_message(
-                frames=data["image_frames"].flatten(0, 1),
-                camera_indices=data["camera_indices"],
-                question=question,
-                num_frames_per_camera=num_frames,
-            )
-        else:
-            messages = helper.create_message(
-                frames=data["image_frames"].flatten(0, 1),
-                camera_indices=data["camera_indices"],
-                num_frames_per_camera=num_frames,
-                nav_text=item.get("nav_text"),
-                use_nav_prompt=bool(item.get("use_nav_prompt", False)),
-            )
+    #     question = item.get("question")
+    #     if question:
+    #         messages = helper.create_vqa_message(
+    #             frames=data["image_frames"].flatten(0, 1),
+    #             camera_indices=data["camera_indices"],
+    #             question=question,
+    #             num_frames_per_camera=num_frames,
+    #         )
+    #     else:
+    #         messages = helper.create_message(
+    #             frames=data["image_frames"].flatten(0, 1),
+    #             camera_indices=data["camera_indices"],
+    #             num_frames_per_camera=num_frames,
+    #             nav_text=item.get("nav_text"),
+    #             use_nav_prompt=bool(item.get("use_nav_prompt", False)),
+    #         )
 
-        return messages, data
+    #     return messages, data
 
-    def _combine_image_traj(self, input_data: str, traj_data_vlm: dict[str, Any]) -> str:
-        """Char-level version of `fuse_traj_tokens`.
+    # def _combine_image_traj(self, input_data: str, traj_data_vlm: dict[str, Any]) -> str:
+    #     """Char-level version of `fuse_traj_tokens`.
 
-        `fuse_traj_tokens` replaces the tokenizer id for `<|traj_history|>` with the
-        discretized history trajectory token ids. Here we do the same replacement one
-        level earlier, directly on the prompt string, by swapping the repeated
-        `<|traj_history|>` placeholders with concrete `<i...>` token strings.
-        """
-        if not isinstance(input_data, str):
-            raise TypeError(
-                f"_combine_image_traj expects a prompt string, but got {type(input_data)}"
-            )
-        if self.hist_traj_tokenizer is None:
-            return input_data
-        if (
-            traj_data_vlm is None
-            or traj_data_vlm.get("ego_history_xyz") is None
-            or traj_data_vlm.get("ego_history_rot") is None
-        ):
-            return input_data
+    #     `fuse_traj_tokens` replaces the tokenizer id for `<|traj_history|>` with the
+    #     discretized history trajectory token ids. Here we do the same replacement one
+    #     level earlier, directly on the prompt string, by swapping the repeated
+    #     `<|traj_history|>` placeholders with concrete `<i...>` token strings.
+    #     """
+    #     if not isinstance(input_data, str):
+    #         raise TypeError(
+    #             f"_combine_image_traj expects a prompt string, but got {type(input_data)}"
+    #         )
+    #     if self.hist_traj_tokenizer is None:
+    #         return input_data
+    #     if (
+    #         traj_data_vlm is None
+    #         or traj_data_vlm.get("ego_history_xyz") is None
+    #         or traj_data_vlm.get("ego_history_rot") is None
+    #     ):
+    #         return input_data
 
-        hist_idx = tokenize_history_trajectory(
-            self.hist_traj_tokenizer,
-            traj_data_vlm,
-            self.hist_token_start_idx,
-        )
-        if hist_idx.shape[0] != 1:
-            raise ValueError(
-                f"_combine_image_traj currently expects batch size 1, got {hist_idx.shape[0]}"
-            )
+    #     hist_idx = tokenize_history_trajectory(
+    #         self.hist_traj_tokenizer,
+    #         traj_data_vlm,
+    #         self.hist_token_start_idx,
+    #     )
+    #     if hist_idx.shape[0] != 1:
+    #         raise ValueError(
+    #             f"_combine_image_traj currently expects batch size 1, got {hist_idx.shape[0]}"
+    #         )
 
-        hist_token_strings = self.underlying_data_packer.tokenizer.convert_ids_to_tokens(
-            hist_idx[0].tolist()
-        )
-        fused_hist_str = "".join(hist_token_strings)
+    #     hist_token_strings = self.underlying_data_packer.tokenizer.convert_ids_to_tokens(
+    #         hist_idx[0].tolist()
+    #     )
+    #     fused_hist_str = "".join(hist_token_strings)
 
-        start_token = TRAJ_TOKEN["history_start"]
-        pad_token = TRAJ_TOKEN["history"]
-        end_token = TRAJ_TOKEN["history_end"]
-        start_idx = input_data.find(start_token)
-        end_idx = input_data.find(end_token)
-        if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
-            return input_data
+    #     start_token = TRAJ_TOKEN["history_start"]
+    #     pad_token = TRAJ_TOKEN["history"]
+    #     end_token = TRAJ_TOKEN["history_end"]
+    #     start_idx = input_data.find(start_token)
+    #     end_idx = input_data.find(end_token)
+    #     if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
+    #         return input_data
 
-        content_start = start_idx + len(start_token)
-        inner = input_data[content_start:end_idx]
-        if pad_token not in inner:
-            return input_data
+    #     content_start = start_idx + len(start_token)
+    #     inner = input_data[content_start:end_idx]
+    #     if pad_token not in inner:
+    #         return input_data
 
-        return input_data[:content_start] + fused_hist_str + input_data[end_idx:]
+    #     return input_data[:content_start] + fused_hist_str + input_data[end_idx:]
         
-    def _build_vllm_prompt(self, prompt: str, data: dict[str, Any]) -> str:
-        ego_history_xyz = data["ego_history_xyz"]
-        ego_history_rot = data["ego_history_rot"]
-        _, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        return self._combine_image_traj(prompt, traj_data_vlm)
+    # def _build_vllm_prompt(self, prompt: str, data: dict[str, Any]) -> str:
+    #     ego_history_xyz = data["ego_history_xyz"]
+    #     ego_history_rot = data["ego_history_rot"]
+    #     _, n_traj_group, _, _ = ego_history_xyz.shape
+    #     assert n_traj_group == 1, "Only one trajectory group is supported for inference."
+    #     traj_data_vlm = {
+    #         "ego_history_xyz": ego_history_xyz,
+    #         "ego_history_rot": ego_history_rot,
+    #     }
+    #     return self._combine_image_traj(prompt, traj_data_vlm)
 
+    # def get_rollout_input(self, item: Any) -> Any:
+    #     """
+    #     Convert one Alpamayo sample descriptor into the rollout-engine input format.
+
+    #     Output format is delegated to `Qwen3_VL_DataPacker`, so the final return value
+    #     is still the standard:
+    #     {
+    #         "prompt": ...,
+    #         "multi_modal_data": {"image": ...},
+    #     }
+    #     """
+    #     assert isinstance(item, dict), (
+    #         f"AlphaDataPacker expects dict items from dataset, but got {type(item)}"
+    #     )
+    #     messages, data = self._build_messages(item)
+    #     vllm_inputs = self.underlying_data_packer.get_rollout_input(messages)
+    #     vllm_inputs = {k: v for k, v in vllm_inputs.items() if k != "prompt"}
+
+    #     prompt = self.underlying_data_packer.hf_processor.apply_chat_template(
+    #         messages,
+    #         tokenize=False,
+    #         add_generation_prompt=False,
+    #         continue_final_message=True,
+    #     )
+    #     vllm_inputs["prompt"] = self._build_vllm_prompt(prompt, data)
+    #     return vllm_inputs
+
+    # def rollout_collate_fn(self, items: list[Any]) -> Any:
+    #     return self.underlying_data_packer.rollout_collate_fn(items)
+
+    # def get_policy_input(
+    #     self, item: Any, rollout_output: str, n_ignore_prefix_tokens: int = 0
+    # ) -> Any:
+    #     messages, _ = self._build_messages(item)
+    #     return self.underlying_data_packer.get_policy_input(
+    #         messages,
+    #         rollout_output,
+    #         n_ignore_prefix_tokens,
+    #         add_generation_prompt=False,
+    #     )
+
+    # def policy_compute_max_len(self, processed_samples: list[Any]) -> int:
+    #     return self.underlying_data_packer.policy_compute_max_len(processed_samples)
+
+    # def policy_collate_fn(
+    #     self, processed_samples: list[Any], computed_max_len: int
+    # ) -> dict[str, Any]:
+    #     return self.underlying_data_packer.policy_collate_fn(
+    #         processed_samples, computed_max_len
+    #     )
     def get_rollout_input(self, item: Any) -> Any:
         """
-        Convert one Alpamayo sample descriptor into the rollout-engine input format.
-
-        Output format is delegated to `Qwen3_VL_DataPacker`, so the final return value
-        is still the standard:
-        {
-            "prompt": ...,
-            "multi_modal_data": {"image": ...},
-        }
+        Convert dataset item into what rollout engine (e.g. vllm) expects
         """
-        assert isinstance(item, dict), (
-            f"AlphaDataPacker expects dict items from dataset, but got {type(item)}"
-        )
-        messages, data = self._build_messages(item)
-        vllm_inputs = self.underlying_data_packer.get_rollout_input(messages)
-        vllm_inputs = {k: v for k, v in vllm_inputs.items() if k != "prompt"}
-
-        prompt = self.underlying_data_packer.hf_processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            continue_final_message=True,
-        )
-        vllm_inputs["prompt"] = self._build_vllm_prompt(prompt, data)
-        return vllm_inputs
+        return self.underlying_data_packer.get_rollout_input(item)
 
     def rollout_collate_fn(self, items: list[Any]) -> Any:
+        """
+        Collate the rollout inputs into a mini-batch for rollout engine
+        """
         return self.underlying_data_packer.rollout_collate_fn(items)
 
     def get_policy_input(
         self, item: Any, rollout_output: str, n_ignore_prefix_tokens: int = 0
     ) -> Any:
-        messages, _ = self._build_messages(item)
+        """
+        Process samples & rollout output before collating them into a mini-batch
+        """
         return self.underlying_data_packer.get_policy_input(
-            messages,
-            rollout_output,
-            n_ignore_prefix_tokens,
-            add_generation_prompt=False,
+            item, rollout_output, n_ignore_prefix_tokens
         )
 
     def policy_compute_max_len(self, processed_samples: list[Any]) -> int:
+        """
+        Compute the maximum sequence length of the mini-batch
+        """
         return self.underlying_data_packer.policy_compute_max_len(processed_samples)
 
     def policy_collate_fn(
         self, processed_samples: list[Any], computed_max_len: int
     ) -> dict[str, Any]:
+        """
+        Collate the mini-batch into the kwargs required by the policy model
+        """
         return self.underlying_data_packer.policy_collate_fn(
             processed_samples, computed_max_len
         )
