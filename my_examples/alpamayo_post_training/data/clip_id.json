@@ -12,6 +12,45 @@
       "time_step": 0.1,
       "num_frames": 4,
       "split": "train"
+    },
+    {
+      "clip_id": "25cd4769-5dcf-4b53-a351-bf2c5deb6124",
+      "t0_us": 5100000,
+      "question": "Describe the current driving scene and predict a safe future trajectory.",
+      "reference_answer": "",
+      "nav_text": "",
+      "use_nav_prompt": false,
+      "num_history_steps": 16,
+      "num_future_steps": 64,
+      "time_step": 0.1,
+      "num_frames": 4,
+      "split": "train"
+    },
+    {
+      "clip_id": "2edf278f-d5e3-4b83-b5df-923a04335725",
+      "t0_us": 5100000,
+      "question": "Describe the current driving scene and predict a safe future trajectory.",
+      "reference_answer": "",
+      "nav_text": "",
+      "use_nav_prompt": false,
+      "num_history_steps": 16,
+      "num_future_steps": 64,
+      "time_step": 0.1,
+      "num_frames": 4,
+      "split": "train"
+    },
+    {
+      "clip_id": "1f47bf7f-d233-480c-b166-7512d8e9ac97",
+      "t0_us": 5100000,
+      "question": "Describe the current driving scene and predict a safe future trajectory.",
+      "reference_answer": "",
+      "nav_text": "",
+      "use_nav_prompt": false,
+      "num_history_steps": 16,
+      "num_future_steps": 64,
+      "time_step": 0.1,
+      "num_frames": 4,
+      "split": "train"
     }
   ]
 }

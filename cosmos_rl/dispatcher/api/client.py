@@ -558,6 +558,7 @@ class APIClient(object):
             r = r.json()
             payloads = r["payloads_list"]
             is_end = r["is_end"]
+            logger.info(f"[my test] Fetched next prompt with batch size {len(payloads)}, is_end: {is_end}")
             return payloads, is_end
         except Exception as e:
             logger.error(

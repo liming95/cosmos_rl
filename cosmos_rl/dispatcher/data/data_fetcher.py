@@ -551,6 +551,7 @@ class ControllerDataFetcher(DataFetcherBase):
                 payload: RLPayload | None = None
                 try:
                     idxs, payloads = _next_payload(iterator, add_answer)
+                    logger.info(f"[my test] Fetched next prompt batch with batch size {len(payloads)}")
                 except StopIteration:
                     if not is_validation:
                         self.epoch += 1

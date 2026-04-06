@@ -87,7 +87,7 @@ def slice_tensor_with_strategy(
     """
 
     view = tensor
-    logger.info(f"[my test] shape: {view.shape}, idx: {idx}, total_size: {tensor_split_strategy.total_size}, offset: {tensor_split_strategy.offset}")
+    # logger.info(f"[my test] shape: {view.shape}, idx: {idx}, total_size: {tensor_split_strategy.total_size}, offset: {tensor_split_strategy.offset}")
     assert view.shape[idx] % tensor_split_strategy.total_size == 0, (
         f"Tensor shape {view.shape} on dim {idx} must be divisible by {tensor_split_strategy.total_size}"
     )
@@ -147,7 +147,7 @@ def get_unified_rank_info(
     """
     size = max(a.total_size, b.total_size)
     # size = lcm(a.total_size, b.total_size)
-    logger.info(f"[my test] slice info:{a}, {b}, size: {size}")
+    # logger.info(f"[my test] slice info:{a}, {b}, size: {size}")
     assert size % a.total_size == 0 and size % b.total_size == 0, (
         "Sizes are not compatible for unification"
     )

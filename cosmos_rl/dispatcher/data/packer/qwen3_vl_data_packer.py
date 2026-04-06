@@ -484,7 +484,10 @@ class Qwen3_VL_DataPacker(DataPacker):
                 image_inputs = conversation["images"]
             else:
                 image_inputs, video_inputs = process_vision_info(conversation)
-                image_inputs = decode_base64_to_image(image_inputs)
+                # image_inputs = decode_base64_to_image(image_inputs)
+
+                if len(image_inputs) > 0 and not isinstance(image_inputs[0], torch.Tensor):
+                    image_inputs = decode_base64_to_image(image_inputs)
 
             kwarg = {
                 "return_tensors": "pt",

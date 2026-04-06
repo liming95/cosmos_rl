@@ -1454,7 +1454,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         start_time = time.time()
         while time.time() - start_time < float(timeout):
             cmd = self.consume_one_command(cmd_pred=cmd_pred)
-            logger.info(f"[my test] rollout control cmd: {cmd}")
+            # logger.info(f"[my test] rollout control cmd: {cmd}")
             if cmd is not None:
                 last_cmd = cmd
                 none_cnt = 0
@@ -1560,6 +1560,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
     @torch.no_grad()
     def main_loop(self):
+        logger.info(f"[Rollout] Main loop of {self.replica_name} started")
         while not self.shutdown_signal.is_set():
             self.consume_command(cmd_pred=None)
             if self.validation_flag.is_set():

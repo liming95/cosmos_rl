@@ -200,7 +200,7 @@ def create_message_with_ego(
 
     # user_text = f"{hist_traj_placeholder}{route_section}{prompt_text}"
     user_text = _build_ego_history_text(tokenizer, ego_history_xyz, ego_history_rot, num_traj_token) + f"{route_section}{prompt_text}"
-    assert user_text.shape[0] == 1, f"Expected batch size of 1 for user_text, got {user_text.shape[0]}"
+    # assert user_text.shape[0] == 1, f"Expected batch size of 1 for user_text, got {user_text.shape[0]}"
 
     image_content = _build_image_content(frames, camera_indices, num_frames_per_camera)
 
@@ -216,7 +216,7 @@ def create_message_with_ego(
         },
         {
             "role": "user",
-            "content": image_content + [{"type": "text", "text": user_text[0]}],
+            "content": image_content + [{"type": "text", "text": user_text}],
         },
         {
             "role": "assistant",
@@ -233,7 +233,7 @@ def _build_ego_history_text(
     hist_traj_start = "<|traj_history_start|>"
     hist_traj_end = "<|traj_history_end|>"
 
-    traj_placeholder = f"{hist_traj_start}{'<|traj_history|>' * num_traj_token}{hist_traj_end}"
+    # traj_placeholder = f"{hist_traj_start}{'<|traj_history|>' * num_traj_token}{hist_traj_end}"
 
     # assert "ego_history_xyz" in traj_data
     assert ego_history_xyz.ndim == 4, "ego_history_xyz must be 4D of [B, n_traj, T, 3]"
@@ -246,37 +246,45 @@ def _build_ego_history_text(
     start_idx = 151669  # the index of the first <|traj_history|> token in the tokenizer vocab
     hist_idx = _traj_encoder(hist_xyz[:, :1], hist_rot[:, :1], hist_xyz, hist_rot) + start_idx
     hist_idx = einops.rearrange(hist_idx, "(b n_traj) n -> b (n_traj n)", b=B)
-
+    print(f"hist_idx shape: {hist_idx.shape}, expected (B, num_traj_token)")
+    print(f"hist_idx: {hist_idx}")
     hist_traj_text = tokenizer.batch_decode(hist_idx, skip_special_tokens=True)
+    print(f"decoded historical trajectory text: {hist_traj_text}")  # Log the decoded text for the first batch element
+    recovered_idx = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(hist_traj_text[0], add_special_tokens=False))
+    print(f"length: {len(recovered_idx)}, recovered_idx: {recovered_idx}")
+    # token_id = tokenizer.encode(hist_traj_start)
+    # print(f"Decoded historical trajectory text: {hist_traj_text[0]}")  # Log the decoded text for the first batch element
 
-    assert hist_traj_text.shape[1] == num_traj_token, f"Expected {num_traj_token} trajectory tokens, got {hist_traj_text.shape[1]}"
-    return hist_traj_text  # return the text for the first batch element (since all are the same in this context)
+    assert len(recovered_idx) == num_traj_token, f"Expected {num_traj_token} trajectory tokens, got {len(recovered_idx)}"
+    assert len(hist_traj_text) == 1, f"Expected batch size of 1 for hist_traj_text, got {len(hist_traj_text)}"
+    # logger.info(f"Decoded historical trajectory text: {hist_traj_text[0]}")  # Log the decoded text for the first batch element
+    hist_traj_text = [hist_traj_start + text + hist_traj_end for text in hist_traj_text]
+
+    return hist_traj_text[0]  # return the text for the first batch element (since all are the same in this context)
 
 def _traj_encoder(
     hist_xyz: torch.Tensor,
     hist_rot: torch.Tensor,
     fut_xyz: torch.Tensor,
     fut_rot: torch.Tensor,
+    hist_tstamp: torch.Tensor | None = None,
+    fut_tstamp: torch.Tensor | None = None,
 ) -> list[int]:
-    """Encode continuous trajectory data into discrete tokens.
-
-    This is a placeholder function that represents the process of
-    encoding the historical trajectory (position and rotation) of the
-    ego vehicle into a sequence of discrete tokens that can be inserted
-    into the user message content. The actual encoding logic would depend
-    on the specific tokenization scheme used during model training.
+    """
+    Encodes the trajectories as discrete tokens. The model conditions on the historical
+    waypoints to tokenize the future waypoints. Trajectories can be provided in any coordinate
+    frame. Timestamps can be provided with any time-origin.
 
     Args:
-        hist_xyz: Tensor of shape ``(B * n_traj, T, 3)`` containing the XYZ
-            positions of the ego vehicle's historical trajectory.
-        hist_rot: Tensor of shape ``(B * n_traj, T, 4)`` containing the
-            rotations (quaternions) of the ego vehicle's historical
-            trajectory.
-        full_xyz: Tensor containing the full XYZ trajectory (historical + future).
-        full_rot: Tensor containing the full rotation trajectory (historical + future).
+        hist_xyz (torch.Tensor): Historical locations XYZ. Shape: (B, Th, 3).
+        hist_rot (torch.Tensor): Historical rotations. Shape: (B, Th, 3, 3).
+        fut_xyz (torch.Tensor): Future locations XYZ. Shape: (B, Tf, 3).
+        fut_rot (torch.Tensor): Future rotations. Shape: (B, Tf, 3, 3).
+        hist_tstamp (torch.Tensor): Historical time stamps. Shape: (B, Th).
+        fut_tstamp (torch.Tensor): Future time stamps. Shape: (B, Tf).
 
     Returns:
-        A list of integer tokens representing the encoded trajectory.
+        torch.LongTensor: The token indices. Shape: (B, num_tokens_per_trajectory).
     """
     del hist_xyz, hist_rot, hist_tstamp, fut_tstamp
     ego_xyz_max = [4, 4, 10]

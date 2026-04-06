@@ -1,0 +1,7 @@
+# tail model
+python ./tail_model.py
+## introduction
+extract vlm model from the alpamayo1_5. Meanwhile, we also try to custome smaller size model for test by skip language_model.layers. config.text_config.num_hidden_layers
+## issue
+- config.text_config is the main parameters for building language model
+- model.model.language_model.layers
